@@ -102,7 +102,6 @@ const renderIncidents = async () => {
   state.incidents = data.items;
   state.incidentStats = data.stats;
 
-  const visibleCols = getVisibleColumns() || ['id','title','severityLabel','attackResultLabel','entities','organization','updatedAt'];
   return h`
     <div class="page-head">
       <h1>安全事件</h1>
@@ -144,15 +143,13 @@ const renderIncidents = async () => {
         <thead>
           <tr>
             <th><input type="checkbox"></th>
-            ${visibleCols.includes('id') ? '<th>编号</th>' : ''}
-            ${visibleCols.includes('title') ? '<th>标题</th>' : ''}
-            ${visibleCols.includes('severityLabel') ? '<th>严重等级</th>' : ''}
-            ${visibleCols.includes('attackResultLabel') ? '<th>攻击结果</th>' : ''}
-            ${visibleCols.includes('category') ? '<th>分类</th>' : ''}
-            ${visibleCols.includes('dataSource') ? '<th>数据源</th>' : ''}
-            ${visibleCols.includes('entities') ? '<th>影响实体</th>' : ''}
-            ${visibleCols.includes('organization') ? '<th>组织机构</th>' : ''}
-            ${visibleCols.includes('updatedAt') ? '<th>更新时间</th>' : ''}
+            <th>编号</th>
+            <th>标题</th>
+            <th>严重等级</th>
+            <th>攻击结果</th>
+            <th>影响实体</th>
+            <th>组织机构</th>
+            <th>更新时间</th>
             <th>操作</th>
           </tr>
         </thead>
@@ -160,15 +157,13 @@ const renderIncidents = async () => {
           ${data.items.map((item) => `
             <tr>
               <td><input type="checkbox"></td>
-              ${visibleCols.includes('id') ? `<td>#${esc(item.id)}</td>` : ''}
-              ${visibleCols.includes('title') ? `<td>${esc(item.title)}</td>` : ''}
-              ${visibleCols.includes('severityLabel') ? `<td><span class="tag ${esc(item.severity)}">${esc(item.severityLabel)}</span></td>` : ''}
-              ${visibleCols.includes('attackResultLabel') ? `<td><span class="tag">${esc(item.attackResultLabel)}</span></td>` : ''}
-              ${visibleCols.includes('category') ? `<td>${esc(item.category)}</td>` : ''}
-              ${visibleCols.includes('dataSource') ? `<td>${esc(item.dataSource)}</td>` : ''}
-              ${visibleCols.includes('entities') ? `<td>IP ${item.entities.ip}　主机 ${item.entities.host}　账号 ${item.entities.account}</td>` : ''}
-              ${visibleCols.includes('organization') ? `<td>${esc(item.organization)}</td>` : ''}
-              ${visibleCols.includes('updatedAt') ? `<td>${esc(item.updatedAt)}</td>` : ''}
+              <td>#${esc(item.id)}</td>
+              <td>${esc(item.title)}</td>
+              <td><span class="tag ${esc(item.severity)}">${esc(item.severityLabel)}</span></td>
+              <td><span class="tag">${esc(item.attackResultLabel)}</span></td>
+              <td>IP ${item.entities.ip}　主机 ${item.entities.host}　账号 ${item.entities.account}</td>
+              <td>${esc(item.organization)}</td>
+              <td>${esc(item.updatedAt)}</td>
               <td><button class="link-btn" data-incident-detail="${esc(item.id)}">详情</button>　<button class="link-btn" data-incident-graph="${esc(item.id)}">攻击图谱</button></td>
             </tr>
           `).join('')}
@@ -307,105 +302,24 @@ const renderIncidentDetail = async (id, tab = 'overview') => {
   const tabLabels = { overview: '概览', alerts: '告警', graph: '威胁图谱', evidence: '相关证据', impact: '影响面' };
   const detail = await api(`/api/security/incidents/${id}/${tab}`);
   const tabContent = {
-    overview: () => {
-      const phaseKeys = Object.keys(detail.phases);
-      const activePhases = phaseKeys.filter((k) => detail.phases[k] > 0);
-      const totalPhases = phaseKeys.length;
-      return `
+    overview: () => `
       <div class="cards">
         <div class="card"><strong>${detail.alertCount}</strong><p>告警总量</p></div>
-        <div class="card"><strong>${detail.coreAlertCount || 0}</strong><p>核心告警</p></div>
+        <div class="card"><strong>${detail.pendingAlertCount}</strong><p>待处置告警</p></div>
         <div class="card"><strong>${detail.entities.ip}</strong><p>内网 IP</p></div>
         <div class="card"><strong>${detail.entities.host}</strong><p>主机</p></div>
       </div>
-      <h3 style="margin:18px 0 10px;font-size:15px">攻击阶段</h3>
-      <div class="kill-chain">
-        ${phaseKeys.map((key, i) => {
-          const label = detail.phaseLabels[key] || key;
-          const active = detail.phases[key] > 0;
-          return `<div class="kill-phase ${active ? 'active' : ''}">
-            <div class="kill-dot"></div>
-            <span>${esc(label)}</span>
-            ${i < phaseKeys.length - 1 ? '<div class="kill-line"></div>' : ''}
-          </div>`;
-        }).join('')}
-      </div>
-      <h3 style="margin:18px 0 10px;font-size:15px">ATT&CK 技战术</h3>
-      <div class="attack-grid">
-        ${(detail.attack.tactics || []).map((t) => `
-          <div class="attack-tactic ${t.count > 0 ? 'active' : ''}">
-            <div class="attack-id">${esc(t.id)}</div>
-            <div class="attack-name">${esc(t.name)}</div>
-            ${t.count > 0 ? `<div class="attack-count">${t.count}</div>` : ''}
-          </div>
-        `).join('')}
-      </div>
-      <h3 style="margin:18px 0 10px;font-size:15px">证据概览</h3>
-      <div class="cards" style="grid-template-columns:repeat(3,1fr)">
-        <div class="card"><strong>${detail.evidence.intelligence}</strong><p>威胁情报</p></div>
-        <div class="card"><strong>${detail.evidence.malware}</strong><p>恶意样本</p></div>
-        <div class="card"><strong>${detail.evidence.suspiciousFile}</strong><p>可疑文件</p></div>
-      </div>
-    `;},
+      <div class="empty" style="margin-top:14px">ATT&CK 技战术暂无数据</div>
+    `,
     alerts: () => `
       <div class="table-wrap"><table>
         <thead><tr><th>开始时间</th><th>等级</th><th>告警名称</th><th>关联条件</th><th>受害者</th><th>攻击结果</th><th>标识</th></tr></thead>
         <tbody>${detail.items.map((item) => `<tr><td>${esc(item.startedAt)}</td><td><span class="tag high">${esc(item.severityLabel)}</span></td><td>${esc(item.title)}</td><td>${esc(item.relation)}</td><td>${esc(item.victim)}</td><td>${esc(item.resultLabel)}</td><td>${item.core ? '核心告警' : ''} ${item.entry ? '入口告警' : ''}</td></tr>`).join('')}</tbody>
       </table></div>
     `,
-    graph: () => {
-      const nodeTypes = [...new Set(detail.nodes.map((n) => n.type))];
-      return `
-      <div class="graph-controls">
-        <span class="graph-label">节点筛选：</span>
-        ${nodeTypes.map((t) => `<button class="graph-filter active" data-graph-filter="${esc(t)}">${esc(t)}</button>`).join('')}
-        <span class="graph-stats">${detail.nodes.length} 个节点、${detail.edges.length} 条关系</span>
-      </div>
-      <div id="threat-graph" style="height:480px;border:1px solid var(--line);border-radius:8px;background:#fbfcfd"></div>
-      <script>window.__graphData=${JSON.stringify(detail)};</script>
-    `;},
-    evidence: () => {
-      const evidenceTab = state.evidenceTab || 'malware';
-      const tabs = [
-        { key: 'intelligence', label: '威胁情报', count: detail.intelligence.length },
-        { key: 'malware', label: '恶意样本', count: detail.malware.length },
-        { key: 'suspiciousFiles', label: '可疑文件', count: detail.suspiciousFiles.length }
-      ];
-      const intelTable = detail.intelligence.length > 0
-        ? `<div class="table-wrap"><table><thead><tr><th>指标</th><th>类型</th><th>来源</th><th>置信度</th><th>匹配时间</th><th>操作</th></tr></thead><tbody>${detail.intelligence.map((item) => `<tr><td>${esc(item.indicator)}</td><td>${esc(item.type)}</td><td>${esc(item.source)}</td><td>${esc(item.confidence)}</td><td>${esc(item.matchedAt)}</td><td><button class="link-btn">查看告警</button></td></tr>`).join('')}</tbody></table></div>`
-        : '<div class="empty">暂无威胁情报数据</div>';
-      const malwareTable = detail.malware.length > 0
-        ? `<div class="table-wrap"><table><thead><tr><th>文件MD5</th><th>文件名称</th><th>恶意类型</th><th>风险等级</th><th>检测时间</th><th>数据源</th><th>操作</th></tr></thead><tbody>${detail.malware.map((item) => `<tr><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(item.md5)}">${esc(item.md5)}</td><td>${esc(item.name)}</td><td>${esc(item.type)}</td><td><span class="tag ${esc(item.risk) === '严重' ? 'high' : esc(item.risk) === '警告' ? 'medium' : ''}">${esc(item.risk)}</span></td><td>${esc(item.detectedAt)}</td><td>${esc(item.source)}</td><td><button class="link-btn" data-evidence-alert>查看告警</button>　<button class="link-btn" data-evidence-download>下载</button></td></tr>`).join('')}</tbody></table></div>`
-        : '<div class="empty">暂无恶意样本数据</div>';
-      const suspiciousTable = detail.suspiciousFiles.length > 0
-        ? `<div class="table-wrap"><table><thead><tr><th>文件路径</th><th>MD5</th><th>文件大小</th><th>风险等级</th><th>匹配时间</th><th>操作</th></tr></thead><tbody>${detail.suspiciousFiles.map((item) => `<tr><td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(item.path)}">${esc(item.path)}</td><td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(item.md5)}</td><td>${esc(item.size)}</td><td><span class="tag ${esc(item.risk) === '高危' ? 'high' : 'medium'}">${esc(item.risk)}</span></td><td>${esc(item.matchedAt)}</td><td><button class="link-btn" data-evidence-download>下载</button></td></tr>`).join('')}</tbody></table></div>`
-        : '<div class="empty">暂无可疑文件数据</div>';
-      const contentMap = { intelligence: intelTable, malware: malwareTable, suspiciousFiles: suspiciousTable };
-      return `
-      <div class="evidence-tabs">${tabs.map((t) => `<button class="evidence-tab ${evidenceTab === t.key ? 'active' : ''}" data-evidence-tab="${t.key}">${esc(t.label)} (${t.count})</button>`).join('')}</div>
-      <div style="margin-top:12px">${contentMap[evidenceTab]}</div>
-    `;},
-    impact: () => {
-      const impactTab = state.impactTab || 'hosts';
-      const tabs = [
-        { key: 'hosts', label: '主机', count: detail.hosts.length },
-        { key: 'ips', label: '内网IP', count: detail.ips.length },
-        { key: 'accounts', label: '账号', count: detail.accounts.length }
-      ];
-      const hostTable = detail.hosts.length > 0
-        ? `<div class="table-wrap"><table><thead><tr><th>主机标识</th><th>主机名称</th><th>IP地址</th><th>操作系统</th><th>风险等级</th><th>是否失陷</th><th>持续暴露期</th><th>出现次数</th><th>首次发现</th><th>最近发现</th><th>操作</th></tr></thead><tbody>${detail.hosts.map((item) => `<tr><td>${esc(item.id)}</td><td>${esc(item.name)}</td><td>${esc(item.ip)}</td><td>${esc(item.os)}</td><td><span class="tag ${esc(item.risk) === '高风险' ? 'high' : esc(item.risk) === '中风险' ? 'medium' : 'low'}">${esc(item.risk)}</span></td><td><span class="tag ${esc(item.compromised) === '已失陷' ? 'critical' : esc(item.compromised) === '疑似失陷' ? 'high' : 'low'}">${esc(item.compromised)}</span></td><td>${esc(item.exposure)}</td><td>${esc(item.count)}</td><td>${esc(item.firstSeen)}</td><td>${esc(item.lastSeen)}</td><td><button class="link-btn" data-impact-detail>查看详情</button>　<button class="link-btn" data-impact-alerts>查看告警</button></td></tr>`).join('')}</tbody></table></div>`
-        : '<div class="empty">暂无受影响主机</div>';
-      const ipTable = detail.ips.length > 0
-        ? `<div class="table-wrap"><table><thead><tr><th>IP地址</th><th>类型</th><th>风险等级</th><th>所属组织</th><th>首次发现</th><th>最近发现</th><th>出现次数</th><th>操作</th></tr></thead><tbody>${detail.ips.map((item) => `<tr><td>${esc(item.ip)}</td><td>${esc(item.type)}</td><td><span class="tag medium">${esc(item.risk)}</span></td><td>${esc(item.owner)}</td><td>${esc(item.firstSeen)}</td><td>${esc(item.lastSeen)}</td><td>${esc(item.count)}</td><td><button class="link-btn" data-impact-detail>查看详情</button>　<button class="link-btn" data-impact-alerts>查看告警</button></td></tr>`).join('')}</tbody></table></div>`
-        : '<div class="empty">暂无受影响内网IP</div>';
-      const accountTable = detail.accounts.length > 0
-        ? `<div class="table-wrap"><table><thead><tr><th>账号</th><th>域</th><th>风险等级</th><th>是否失陷</th><th>最近活跃</th><th>操作次数</th><th>操作</th></tr></thead><tbody>${detail.accounts.map((item) => `<tr><td>${esc(item.name)}</td><td>${esc(item.domain)}</td><td><span class="tag ${esc(item.risk) === '高风险' ? 'high' : 'medium'}">${esc(item.risk)}</span></td><td><span class="tag ${esc(item.compromised) === '已失陷' ? 'critical' : 'high'}">${esc(item.compromised)}</span></td><td>${esc(item.lastSeen)}</td><td>${esc(item.count)}</td><td><button class="link-btn" data-impact-detail>查看详情</button>　<button class="link-btn" data-impact-alerts>查看告警</button></td></tr>`).join('')}</tbody></table></div>`
-        : '<div class="empty">暂无受影响账号</div>';
-      const contentMap = { hosts: hostTable, ips: ipTable, accounts: accountTable };
-      return `
-      <div class="evidence-tabs">${tabs.map((t) => `<button class="evidence-tab ${impactTab === t.key ? 'active' : ''}" data-impact-tab="${t.key}">${esc(t.label)} (${t.count})</button>`).join('')}</div>
-      <div style="margin-top:12px">${contentMap[impactTab]}</div>
-    `;}
+    graph: () => `<div class="empty">已加载 ${detail.nodes.length} 个节点、${detail.edges.length} 条关系。图谱交互将在第二阶段完善。</div>`,
+    evidence: () => `<div class="table-wrap"><table><thead><tr><th>文件MD5</th><th>文件名称</th><th>恶意类型</th><th>风险等级</th><th>操作</th></tr></thead><tbody>${detail.malware.map((item) => `<tr><td>${esc(item.md5)}</td><td>${esc(item.name)}</td><td>${esc(item.type)}</td><td>${esc(item.risk)}</td><td><button class="link-btn">查看告警</button>　<button class="link-btn">下载</button></td></tr>`).join('')}</tbody></table></div>`,
+    impact: () => `<div class="table-wrap"><table><thead><tr><th>主机标识</th><th>主机名称</th><th>IP地址</th><th>风险等级</th><th>是否失陷</th><th>出现次数</th><th>最近发现时间</th></tr></thead><tbody>${detail.hosts.map((item) => `<tr><td>${esc(item.id)}</td><td>${esc(item.name)}</td><td>${esc(item.ip)}</td><td>${esc(item.risk)}</td><td>${esc(item.compromised)}</td><td>${esc(item.count)}</td><td>${esc(item.lastSeen)}</td></tr>`).join('')}</tbody></table></div>`
   }[tab];
   return h`
     <div class="detail-head panel">
@@ -516,56 +430,6 @@ const createIncidentForm = (logIds) => `
   </div>
 `;
 
-const openTableFieldsConfig = async () => {
-  const fields = await api('/api/security/incidents/table-fields');
-  const saved = JSON.parse(localStorage.getItem('incidentTableFields') || 'null');
-  const currentFields = saved || fields;
-  const modal = document.createElement('div');
-  modal.className = 'modal-backdrop';
-  modal.innerHTML = `
-    <div class="modal" style="max-width:480px">
-      <div class="modal-head"><h2>配置表格字段</h2><button class="btn ghost" data-close-modal>关闭</button></div>
-      <div class="field-config-list">
-        ${currentFields.map((f) => `
-          <label class="field-toggle">
-            <input type="checkbox" data-field-key="${esc(f.key)}" ${f.visible ? 'checked' : ''}>
-            <span>${esc(f.label)}</span>
-          </label>
-        `).join('')}
-      </div>
-      <div class="actions" style="justify-content:flex-end;margin-top:16px">
-        <button class="btn ghost" data-fields-reset>恢复默认</button>
-        <button class="btn primary" data-fields-save>保存</button>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(modal);
-  modal.addEventListener('click', async (e) => {
-    const t = e.target;
-    if (t.matches('[data-close-modal]')) modal.remove();
-    if (t.matches('[data-fields-reset]')) {
-      localStorage.removeItem('incidentTableFields');
-      modal.remove();
-      toast('已恢复默认字段配置');
-      render();
-    }
-    if (t.matches('[data-fields-save]')) {
-      const checkboxes = modal.querySelectorAll('[data-field-key]');
-      const config = [...checkboxes].map((cb) => ({ key: cb.dataset.fieldKey, label: cb.nextElementSibling.textContent, visible: cb.checked }));
-      localStorage.setItem('incidentTableFields', JSON.stringify(config));
-      modal.remove();
-      toast('字段配置已保存');
-      render();
-    }
-  });
-};
-
-const getVisibleColumns = () => {
-  const saved = JSON.parse(localStorage.getItem('incidentTableFields') || 'null');
-  if (!saved) return null;
-  return saved.filter((f) => f.visible).map((f) => f.key);
-};
-
 const bindEvents = () => {
   app.onclick = async (event) => {
     const target = event.target;
@@ -577,7 +441,7 @@ const bindEvents = () => {
     }
     if (target.matches('[data-open-hql]')) openLogModal();
     if (target.matches('[data-create-incident]')) openLogModal({ createMode: true });
-    if (target.matches('[data-table-fields]')) openTableFieldsConfig();
+    if (target.matches('[data-table-fields]')) toast('字段配置将在第二阶段接入持久化');
     if (target.matches('[data-incident-detail]')) setRoute(`#/incidents/${target.dataset.incidentDetail}/overview`);
     if (target.matches('[data-incident-graph]')) setRoute(`#/incidents/${target.dataset.incidentGraph}/graph`);
     if (target.matches('[data-scene]')) {
@@ -619,78 +483,7 @@ const bindEvents = () => {
       setRoute(`#/models/${saved.id}`);
     }
     if (target.matches('[data-incident-tab]')) setRoute(`#/incidents/${target.dataset.id}/${target.dataset.incidentTab}`);
-    if (target.matches('[data-evidence-tab]')) {
-      state.evidenceTab = target.dataset.evidenceTab;
-      render();
-    }
-    if (target.matches('[data-impact-tab]')) {
-      state.impactTab = target.dataset.impactTab;
-      render();
-    }
-    if (target.matches('[data-evidence-alert]')) toast('查看告警功能将在后续版本完善');
-    if (target.matches('[data-evidence-download]')) toast('下载功能将在后续版本完善');
-    if (target.matches('[data-impact-detail]')) toast('实体详情将在后续版本完善');
-    if (target.matches('[data-impact-alerts]')) toast('实体关联告警将在后续版本完善');
-    if (target.matches('[data-graph-filter]')) {
-      const type = target.dataset.graphFilter;
-      target.classList.toggle('active');
-      const panel = target.closest('.panel');
-      const network = panel?.__graphNetwork;
-      const allNodes = panel?.__graphNodes;
-      if (!network || !allNodes) return;
-      const activeTypes = [...panel.querySelectorAll('.graph-filter.active')].map((b) => b.dataset.graphFilter);
-      const updates = allNodes.map((n) => ({ id: n.id, hidden: !activeTypes.includes(n._type) }));
-      allNodes.update(updates);
-    }
   };
-};
-
-const initGraph = () => {
-  const container = document.getElementById('threat-graph');
-  const data = window.__graphData;
-  if (!container || !data || typeof vis === 'undefined') return;
-
-  const riskColor = { '严重': '#bd2d2d', '警告': '#c57b2c', '提醒': '#2f6f9f', '紧急': '#bd2d2d' };
-  const typeShape = { '事件': 'diamond', '告警': 'dot' };
-  const typeColor = { '事件': '#176b5c', '告警': '#5B8DEF' };
-
-  const nodes = new vis.DataSet(data.nodes.map((n) => ({
-    id: n.id,
-    label: n.label.length > 24 ? n.label.slice(0, 22) + '…' : n.label,
-    shape: typeShape[n.type] || 'dot',
-    color: {
-      background: typeColor[n.type] || '#999',
-      border: riskColor[n.risk] || '#999',
-      highlight: { background: typeColor[n.type] || '#999', border: '#111' }
-    },
-    font: { size: 12, color: '#16212d', strokeWidth: 2, strokeColor: '#fff' },
-    size: n.type === '事件' ? 28 : 18,
-    title: `${n.type}：${n.label}\n等级：${n.risk}`,
-    _type: n.type
-  })));
-
-  const edges = new vis.DataSet(data.edges.map((e, i) => ({
-    id: `e-${i}`,
-    from: e.from,
-    to: e.to,
-    label: e.label,
-    font: { size: 11, color: '#647386', align: 'middle' },
-    color: { color: '#b0bec5', highlight: '#176b5c' },
-    arrows: 'to',
-    smooth: { type: 'cubicBezier', forceDirection: 'none', roundness: 0.4 }
-  })));
-
-  const network = new vis.Network(container, { nodes, edges }, {
-    physics: { stabilization: { iterations: 120 }, barnesHut: { gravitationalConstant: -3000, springLength: 160 } },
-    interaction: { hover: true, tooltipDelay: 200 },
-    nodes: { borderWidth: 2 },
-    edges: { width: 1.5 }
-  });
-
-  container.closest('.panel').__graphNetwork = network;
-  container.closest('.panel').__graphNodes = nodes;
-
-  network.on('stabilizationIterationsDone', () => { network.setOptions({ physics: false }); });
 };
 
 const render = async () => {
@@ -706,7 +499,6 @@ const render = async () => {
     else content = await renderIncidents();
     app.innerHTML = shell(content);
     bindEvents();
-    if (state.route.includes('/graph')) requestAnimationFrame(initGraph);
   } catch (error) {
     app.innerHTML = shell(`<section class="panel"><h1>页面加载失败</h1><p>${esc(error.message)}</p></section>`);
   }

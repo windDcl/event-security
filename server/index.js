@@ -402,6 +402,9 @@ const router = async (req, res) => {
       incidents.unshift(incident);
       return json(res, 201, incident);
     }
+    if (pathname === '/api/security/incidents/table-fields' && req.method === 'GET') {
+      return json(res, 200, tableFields);
+    }
     const incidentMatch = pathname.match(/^\/api\/security\/incidents\/([^/]+)(?:\/([^/]+))?$/);
     if (incidentMatch && req.method === 'GET') {
       const incident = incidents.find((item) => item.id === incidentMatch[1]);
@@ -409,37 +412,156 @@ const router = async (req, res) => {
       const section = incidentMatch[2];
       if (!section) return json(res, 200, incident);
       if (section === 'overview') {
+        const alertCount = incident.alerts.length;
+        const coreCount = incident.alerts.filter((a) => a.core).length;
+        const entryCount = incident.alerts.filter((a) => a.entry).length;
         return json(res, 200, {
-          phases: { detect: 1, delivery: 0, install: 1, attack: 0, exploit: 1, control: 0 },
-          alertCount: incident.alerts.length,
-          pendingAlertCount: incident.alerts.length,
+          phases: {
+            reconnaissance: alertCount > 0 ? 1 : 0,
+            delivery: entryCount > 0 ? 1 : 0,
+            installation: coreCount > 0 ? 1 : 0,
+            exploitation: 0,
+            command: coreCount > 0 ? 1 : 0,
+            lateralMovement: 0,
+            exfiltration: 0
+          },
+          phaseLabels: {
+            reconnaissance: '侦查',
+            delivery: '投递',
+            installation: '安装',
+            exploitation: '利用',
+            command: '命令控制',
+            lateralMovement: '横向移动',
+            exfiltration: '数据窃取'
+          },
+          alertCount: alertCount,
+          pendingAlertCount: alertCount,
+          coreAlertCount: coreCount,
+          entryAlertCount: entryCount,
           entities: incident.entities,
-          attack: { tacticCount: 0, techniqueCount: 0 },
-          evidence: { intelligence: 0, malware: 1, suspiciousFile: 10 }
+          attack: {
+            tactics: [
+              { id: 'TA0001', name: '初始访问', count: entryCount || 0 },
+              { id: 'TA0002', name: '执行', count: coreCount || 0 },
+              { id: 'TA0003', name: '持久化', count: 0 },
+              { id: 'TA0004', name: '权限提升', count: 0 },
+              { id: 'TA0005', name: '防御规避', count: 0 },
+              { id: 'TA0006', name: '凭证访问', count: 0 },
+              { id: 'TA0007', name: '发现', count: 0 },
+              { id: 'TA0008', name: '横向移动', count: 0 },
+              { id: 'TA0009', name: '采集', count: 0 },
+              { id: 'TA0010', name: '渗出', count: 0 },
+              { id: 'TA0011', name: '命令与控制', count: coreCount || 0 },
+              { id: 'TA0040', name: '影响', count: 0 },
+              { id: 'TA0042', name: '资源开发', count: 0 },
+              { id: 'TA0043', name: '侦察', count: alertCount || 0 }
+            ],
+            tacticCount: [entryCount, coreCount].filter(Boolean).length || 0,
+            techniqueCount: alertCount
+          },
+          evidence: {
+            intelligence: incident.alerts.length > 0 ? Math.min(incident.alerts.length, 3) : 0,
+            malware: coreCount > 0 ? coreCount : 0,
+            suspiciousFile: incident.alerts.length * 5
+          }
         });
       }
       if (section === 'alerts') return json(res, 200, { items: incident.alerts, total: incident.alerts.length });
       if (section === 'graph') {
-        return json(res, 200, {
-          nodes: [
-            { id: incident.id, label: incident.title, type: '事件', risk: incident.severityLabel },
-            ...incident.alerts.map((alert) => ({ id: alert.id, label: alert.title, type: '告警', risk: alert.severityLabel }))
-          ],
-          edges: incident.alerts.map((alert) => ({ from: incident.id, to: alert.id, label: alert.relation }))
+        const graphNodes = [
+          { id: incident.id, label: incident.title, type: '事件', risk: incident.severityLabel }
+        ];
+        const graphEdges = [];
+        const addedIds = new Set([incident.id]);
+        const addNode = (id, label, type, risk) => {
+          if (!addedIds.has(id)) { addedIds.add(id); graphNodes.push({ id, label, type, risk }); }
+        };
+        incident.alerts.forEach((alert) => {
+          addNode(alert.id, alert.title, '告警', alert.severityLabel);
+          graphEdges.push({ from: incident.id, to: alert.id, label: alert.relation });
         });
+        const alertVictims = [...new Set(incident.alerts.map((a) => a.victim).filter(Boolean))];
+        const alertAttackers = [...new Set(incident.alerts.map((a) => a.attacker).filter(Boolean))];
+        alertVictims.forEach((ip, i) => {
+          const hostId = `host-${ip}`;
+          addNode(hostId, `主机 ${ip}`, '主机', incident.severityLabel);
+          incident.alerts.filter((a) => a.victim === ip).forEach((a) => {
+            graphEdges.push({ from: a.id, to: hostId, label: '受害主机' });
+          });
+          const ipId = `ip-${ip}`;
+          addNode(ipId, ip, '内网IP', '中风险');
+          graphEdges.push({ from: hostId, to: ipId, label: '绑定' });
+        });
+        alertAttackers.filter((ip) => ip && ip !== '-').forEach((ip) => {
+          const extId = `ext-${ip}`;
+          addNode(extId, ip, '外网IP', '高风险');
+          incident.alerts.filter((a) => a.attacker === ip).forEach((a) => {
+            graphEdges.push({ from: extId, to: a.id, label: '攻击来源' });
+          });
+        });
+        if (incident.alerts.length > 0 && incident.alerts[0].victim) {
+          const accId = `acc-${incident.id}`;
+          addNode(accId, `admin_${incident.id.slice(-3)}`, '账号', '高风险');
+          graphEdges.push({ from: `ip-${incident.alerts[0].victim}`, to: accId, label: '登录' });
+        }
+        if (incident.alerts.some((a) => a.core)) {
+          const fileId = `file-${incident.id}`;
+          addNode(fileId, 'malware_sample.exe', '文件', '严重');
+          graphEdges.push({ from: `host-${(alertVictims[0] || 'unknown')}`, to: fileId, label: '感染' });
+        }
+        return json(res, 200, { nodes: graphNodes, edges: graphEdges });
       }
       if (section === 'evidence') {
+        const hasAlerts = incident.alerts.length > 0;
         return json(res, 200, {
-          malware: [{ md5: '852d67a27e454bd389fa7f02a8cbce23d', name: '-', type: '其他', risk: '未知' }],
-          intelligence: [],
-          suspiciousFiles: []
+          malware: hasAlerts ? incident.alerts.filter((a) => a.core).map((a, i) => ({
+            md5: `e3b0c44298fc1c149${String(i + 1).padStart(2, '0')}a7a3c6aa06a00ce43800${String(50 + i).padStart(2, '0')}8b0c64b50d05237e9c9fe6f3fb4274f9`,
+            name: a.title.replace(/检测到|病毒/g, '').trim().slice(0, 20) || `malware_${i + 1}.exe`,
+            type: a.type || '恶意程序',
+            risk: a.severityLabel || '严重',
+            detectedAt: a.startedAt,
+            source: incident.dataSource
+          })) : [{ md5: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', name: 'sample.exe', type: '其他', risk: '未知', detectedAt: incident.startTime, source: incident.dataSource }],
+          intelligence: hasAlerts ? [
+            { id: `intel-${incident.id}-1`, indicator: incident.alerts[0]?.victim || '10.0.0.1', type: 'IP', source: '微步在线', confidence: '高', matchedAt: incident.startTime },
+            { id: `intel-${incident.id}-2`, indicator: `malware_hash_${incident.id}`, type: '文件哈希', source: 'VirusTotal', confidence: '中', matchedAt: incident.startTime }
+          ] : [],
+          suspiciousFiles: hasAlerts ? [
+            { path: 'C:\\Windows\\Temp\\update.exe', md5: 'a1b2c3d4e5f678901234567890123456', size: '245KB', risk: '可疑', matchedAt: incident.startTime },
+            { path: 'C:\\Users\\Public\\svchost.exe', md5: 'f6e5d4c3b2a109876543210987654321', size: '1.2MB', risk: '高危', matchedAt: incident.startTime }
+          ] : []
         });
       }
       if (section === 'impact') {
+        const alertVictims = [...new Set(incident.alerts.map((a) => a.victim).filter(Boolean))];
+        const alertAttackers = [...new Set(incident.alerts.map((a) => a.attacker).filter(Boolean))];
         return json(res, 200, {
-          hosts: [{ id: '894856-97cf', name: 'win7-2022moqete', ip: '10.239.194.26', os: '-', risk: '无风险', compromised: '正常', exposure: '无', count: 191, firstSeen: '2026-05-28 08:51:54', lastSeen: incident.endTime }],
-          ips: [],
-          accounts: []
+          hosts: alertVictims.length > 0 ? alertVictims.map((ip, i) => ({
+            id: `host-${String(i + 1).padStart(4, '0')}`,
+            name: `win-pc-${ip.split('.').pop()}`,
+            ip: ip,
+            os: 'Windows 10',
+            risk: incident.severity === 'critical' || incident.severity === 'high' ? '高风险' : '中风险',
+            compromised: i === 0 ? '已失陷' : '疑似失陷',
+            exposure: i === 0 ? '72小时' : '24小时',
+            count: 50 + i * 30,
+            firstSeen: incident.startTime,
+            lastSeen: incident.endTime
+          })) : [{ id: '894856-97cf', name: 'win7-2022moqete', ip: '10.239.194.26', os: 'Windows 7', risk: '无风险', compromised: '正常', exposure: '无', count: 191, firstSeen: '2026-05-28 08:51:54', lastSeen: incident.endTime }],
+          ips: alertVictims.length > 1 ? alertVictims.slice(1).map((ip, i) => ({
+            id: `ip-${String(i + 1).padStart(4, '0')}`,
+            ip: ip,
+            type: '内网IP',
+            risk: '中风险',
+            owner: '总公司全局',
+            firstSeen: incident.startTime,
+            lastSeen: incident.endTime,
+            count: 20 + i * 10
+          })) : [],
+          accounts: incident.alerts.length > 0 ? [
+            { id: `acc-${incident.id}-1`, name: `admin_${incident.id.slice(-3)}`, domain: 'PSBC', risk: '高风险', compromised: '已失陷', lastSeen: incident.endTime, count: 5 },
+            { id: `acc-${incident.id}-2`, name: `svc_backup`, domain: 'PSBC', risk: '中风险', compromised: '疑似失陷', lastSeen: incident.endTime, count: 2 }
+          ] : []
         });
       }
     }
@@ -454,10 +576,6 @@ const router = async (req, res) => {
         { id: 'default', name: '日志检索模板', fields: ['occurredAt', 'eventName', 'eventLevel', 'organization', 'sourceAddress', 'destinationAddress'] }
       ]);
     }
-    if (pathname === '/api/security/incidents/table-fields' && req.method === 'GET') {
-      return json(res, 200, tableFields);
-    }
-
     return sendStatic(req, res, pathname);
   } catch (error) {
     console.error(error);
