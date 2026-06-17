@@ -59,8 +59,6 @@ async function createProducer() {
 
   const producer = kafka.producer({
     allowAutoTopicCreation: false,
-    idempotent: true,
-    transactionalId: `event-security-producer-${Date.now()}`,
   });
 
   try {
@@ -88,7 +86,7 @@ async function createConsumer(topic, groupId, handler) {
     await consumer.connect();
     console.log(`[kafka] consumer connected (group=${groupId}, topic=${topic})`);
 
-    await consumer.subscribe({ topic, fromBeginning: false });
+    await consumer.subscribe({ topic, fromBeginning: true });
 
     await consumer.run({
       eachMessage: async ({ topic: msgTopic, partition, message }) => {

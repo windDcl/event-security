@@ -297,6 +297,46 @@ function mergeEntityArrays(existing, incoming) {
 // ── Core Processing ────────────────────────────────────────────────────────
 
 /**
+ * Normalize alert fields from Flink engine output format to aggregator format.
+ * Flink uses: src_ip, dst_ip, alarm_name, rule_id, user, alarm_content, original_alert_level, suggest
+ * Aggregator expects: attacker, victim, title, type, severity, rule_name, started_at
+ */
+function normalizeFlinkAlert(alert) {
+  const a = { ...alert };
+  // Flink engine drops the original id — generate one if missing
+  if (!a.id) {
+    a.id = `flink-${a.rule_id || 'unknown'}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+  // Flink src_ip → attacker
+  if (a.src_ip && !a.attacker) a.attacker = a.src_ip;
+  // Flink dst_ip → victim
+  if (a.dst_ip && !a.victim) a.victim = a.dst_ip;
+  // Flink alarm_name → title
+  if (a.alarm_name && !a.title) a.title = a.alarm_name;
+  // Flink rule_id → rule_name
+  if (a.rule_id && !a.rule_name) a.rule_name = a.rule_id;
+  // Flink alarm_content → description
+  if (a.alarm_content && !a.description) a.description = a.alarm_content;
+  // Flink original_alert_level → severity mapping (0=unknown, 1=low, 2=medium, 3=high, 4=critical)
+  if (!a.severity && a.original_alert_level != null) {
+    const lvl = Number(a.original_alert_level);
+    a.severity = lvl >= 4 ? 'critical' : lvl >= 3 ? 'high' : lvl >= 2 ? 'medium' : lvl >= 1 ? 'low' : 'unknown';
+  }
+  // Flink start_time → started_at
+  if (a.start_time && !a.started_at) {
+    const ts = typeof a.start_time === 'number' ? new Date(a.start_time).toISOString() : a.start_time;
+    a.started_at = ts;
+  }
+  // Flink user → account
+  if (a.user && !a.account) a.account = a.user;
+  // Default type
+  if (!a.type) a.type = a.sae_template_id || 'unknown';
+  // Default severity
+  if (!a.severity) a.severity = 'medium';
+  return a;
+}
+
+/**
  * Process a single alert message.
  */
 async function processAlert(alert) {
@@ -305,44 +345,47 @@ async function processAlert(alert) {
     return;
   }
 
+  // Normalize Flink engine format to standard fields
+  const normalizedAlert = normalizeFlinkAlert(alert);
+
   // Refresh model cache if stale
   if (Date.now() - lastModelRefresh > MODEL_REFRESH_INTERVAL) {
     await refreshModels();
   }
 
   // Find matching models
-  const matchedModels = findMatchingModels(alert);
+  const matchedModels = findMatchingModels(normalizedAlert);
   if (matchedModels.length === 0) {
-    console.log(`[aggregator] alert ${alert.id} matched no models — skipping`);
+    console.log(`[aggregator] alert ${normalizedAlert.id} matched no models — skipping`);
     return;
   }
 
-  console.log(`[aggregator] alert ${alert.id} matched ${matchedModels.length} model(s)`);
+  console.log(`[aggregator] alert ${normalizedAlert.id} matched ${matchedModels.length} model(s)`);
 
   for (const model of matchedModels) {
     try {
       let incidentDoc;
 
       // Check for existing incident by ice_rule_id + victim
-      const existing = await findExistingIncident(model.id, alert.victim);
+      const existing = await findExistingIncident(model.id, normalizedAlert.victim);
 
       if (existing) {
         // Update existing incident
-        incidentDoc = await updateIncident(existing, alert);
+        incidentDoc = await updateIncident(existing, normalizedAlert);
       } else {
         // Create new incident
-        incidentDoc = buildIncident(alert, model);
+        incidentDoc = buildIncident(normalizedAlert, model);
         await createIncident(incidentDoc);
       }
 
-      // Also index the alert itself into alert-index with incident_id reference
-      await indexAlert(alert, incidentDoc.id);
+      // Also index the raw alert into alert-index with a reference to the incident
+      await indexAlert(normalizedAlert, incidentDoc.id);
 
       // Produce async search task
-      await sendIncidentTask(incidentDoc, alert, model);
+      await sendIncidentTask(incidentDoc, normalizedAlert, model);
     } catch (err) {
       console.error(
-        `[aggregator] error processing alert ${alert.id} with model ${model.id}:`,
+        `[aggregator] error processing alert ${normalizedAlert.id} with model ${model.id}:`,
         err.message
       );
     }
