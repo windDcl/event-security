@@ -12,7 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { validateDsl as validateDslAdvanced, compileToStatement } from './services/dsl.js';
 
 import { initDb, query } from './db.js';
-import { initEs } from './es.js';
+import { initEs, searchIndex, indexDocument } from './es.js';
 import redisClient from './redis.js';
 import { ensureTopics } from './kafka.js';
 import { startAggregator } from './services/aggregator.js';
@@ -26,9 +26,7 @@ const publicDir = path.join(rootDir, 'public');
 const port = Number(process.env.PORT || 4173);
 const host = process.env.HOST || '127.0.0.1';
 
-// ── Mock data (in-memory until M17/M18) ─────────────────────────────────────
-
-const now = Date.now();
+// ── Reference Data ─────────────────────────────────────────────────────────
 
 const dictionaries = {
   severities: [
@@ -54,95 +52,6 @@ const dictionaries = {
 };
 
 const defaultDsl = `processList:\n  - condition: 主机IP = \"\${主机IP}\" and 文件MD5 = \"\${文件MD5}\"\n    source: \"告警\"\n    time: [\"-5h\", \"1h\"]\n    relationship: \"相同的病毒\"\n  - condition: 目的地址 = \"\${源地址}\" or 主机IP = \"\${主机IP}\"\n    source: \"日志\"\n    time: [\"-1h\", \"12h\"]\n    relationship: \"相同的受害者地址\"`;
-
-let logs = Array.from({ length: 36 }).map((_, index) => ({
-  id: `log-${String(index + 1).padStart(3, '0')}`,
-  occurredAt: new Date(now - index * 60_000).toISOString().slice(0, 19).replace('T', ' '),
-  eventName: index % 5 === 0 ? '补丁推送' : 'web访问',
-  eventLevel: index % 7 === 0 ? '警告' : '信息',
-  organization: '总公司全局',
-  sourceAddress: index % 3 === 0 ? '22.200.35.185' : `113.84.209.${228 - index}`,
-  destinationAddress: index % 4 === 0 ? '11.120.12.8' : `11.120.25.${139 + index}`,
-  sourcePort: String(49000 + index),
-  destinationPort: index % 2 === 0 ? '80' : '443',
-  raw: `raw log sample ${index + 1}`
-}));
-
-let incidents = [
-  {
-    id: '633593',
-    title: '病毒爆发-主机10.239.194.26上大量文件感染病毒_更新',
-    severity: 'high',
-    severityLabel: '严重',
-    attackResult: 'unknown',
-    attackResultLabel: '未知',
-    category: '恶意程序',
-    dataSource: '天擎V10(奇安信)',
-    organization: '总公司全局',
-    updatedAt: '2026-06-15 12:33:51',
-    startTime: '2026-06-15 12:33:23',
-    endTime: '2026-06-15 12:33:51',
-    owner: '-',
-    device: '21.208.3.56',
-    modelId: 'model-002',
-    modelName: '[场景模型]主机上大量文件感染病毒_优化',
-    advice: '隔离主机并对恶意样本进行处置。',
-    relatedLogIds: ['log-001'],
-    entities: { ip: 1, host: 1, account: 1 },
-    alerts: [
-      {
-        id: 'alert-001',
-        startedAt: '2026-06-15 12:33:51',
-        severityLabel: '严重',
-        title: '检测到病毒 commonRisk/LRS.Autorun.1',
-        relation: '相同的病毒',
-        type: '恶意程序/其他恶意程序',
-        attacker: '-',
-        victim: '10.239.194.26',
-        tactic: '',
-        resultLabel: '未知',
-        core: true,
-        entry: false
-      },
-      {
-        id: 'alert-002',
-        startedAt: '2026-06-15 12:33:23',
-        severityLabel: '警告',
-        title: '病毒爆发-主机10.239.194.26上大量文件感染病毒_更新',
-        relation: '入口告警',
-        type: '恶意程序/其他恶意程序',
-        attacker: '-',
-        victim: '10.239.194.26',
-        tactic: '',
-        resultLabel: '未知',
-        core: false,
-        entry: true
-      }
-    ]
-  },
-  {
-    id: '4142188',
-    title: '阿测试编辑',
-    severity: 'high',
-    severityLabel: '严重',
-    attackResult: 'unknown',
-    attackResultLabel: '未知',
-    category: '主机异常',
-    dataSource: 'SIEM',
-    organization: '总公司全局',
-    updatedAt: '2026-06-09 14:15:28',
-    startTime: '2026-06-09 14:15:28',
-    endTime: '2026-06-09 14:15:28',
-    owner: '-',
-    device: '21.208.3.56',
-    modelId: 'model-001',
-    modelName: '安全设备检测到主机上登录异常',
-    advice: '',
-    relatedLogIds: [],
-    entities: { ip: 1, host: 0, account: 1 },
-    alerts: []
-  }
-];
 
 const tableFields = [
   { key: 'id', label: '编号', visible: true },
@@ -409,16 +318,120 @@ const sendStatic = (req, res, pathname) => {
   fs.createReadStream(filePath).pipe(res);
 };
 
-// ── In-memory filter helpers (for mock data) ────────────────────────────────
+// ── ES-backed incident helpers ──────────────────────────────────────────────
 
-const listIncidents = (query) => {
-  return incidents.filter((incident) => {
-    if (query.keyword && !`${incident.title} ${incident.id}`.includes(query.keyword)) return false;
-    if (query.severity && incident.severity !== query.severity) return false;
-    if (query.category && incident.category !== query.category) return false;
-    return true;
-  });
+const ATTACK_RESULT_MAP = {
+  success: '攻击成功', failed: '攻击失败', unknown: '未知',
+  '攻击成功': '攻击成功', '攻击失败': '攻击失败', '未知': '未知',
 };
+const SEVERITY_LABEL_MAP = {
+  critical: '紧急', high: '严重', medium: '警告', low: '提醒',
+  '紧急': '紧急', '严重': '严重', '警告': '警告', '提醒': '提醒',
+};
+
+/**
+ * Map an ES incident document to the shape the frontend expects.
+ */
+function mapIncidentToFrontend(doc) {
+  const attackerCount = (doc.attacker_array || []).length;
+  const victimCount = (doc.victim_array || []).length;
+  const relatedAlerts = doc.related_alerts || [];
+  // Deduplicate hosts/accounts from related alerts
+  const hosts = new Set();
+  const accounts = new Set();
+  for (const a of relatedAlerts) {
+    if (a.host || a.hostname) hosts.add(a.host || a.hostname);
+    if (a.account || a.user) accounts.add(a.account || a.user);
+  }
+
+  const severity = doc.severity || 'unknown';
+  const attackResult = doc.attack_result || 'unknown';
+
+  return {
+    id: doc.id,
+    title: doc.title || '未命名事件',
+    severity,
+    severityLabel: SEVERITY_LABEL_MAP[severity] || severity,
+    attackResult,
+    attackResultLabel: ATTACK_RESULT_MAP[attackResult] || attackResult,
+    category: doc.scene_type || '',
+    dataSource: doc.data_source || '',
+    organization: doc.organization || '',
+    updatedAt: doc.update_time || doc.end_time || '',
+    startTime: doc.start_time || '',
+    endTime: doc.end_time || '',
+    owner: doc.owner || '-',
+    device: (doc.victim_array && doc.victim_array[0]?.ip) || '-',
+    modelId: doc.ice_rule_id || null,
+    modelName: doc.model_name || '',
+    advice: doc.advice || '',
+    relatedLogIds: [],
+    entities: { ip: attackerCount + victimCount, host: hosts.size, account: accounts.size },
+    // Attach raw data for detail views
+    alerts: relatedAlerts,
+    graph: doc.graph || { nodes: [], edges: [] },
+    entities_raw: doc.entities || { hosts: [], ips: [], accounts: [], files: [] },
+    attacker_array: doc.attacker_array || [],
+    victim_array: doc.victim_array || [],
+    priority: doc.priority || 0,
+  };
+}
+
+/**
+ * Query ES for incidents with optional keyword/severity filtering.
+ * Returns { items, total, stats } in the format the frontend expects.
+ */
+async function listIncidentsFromEs(queryParams) {
+  const must = [];
+  const filter = [];
+
+  if (queryParams.keyword) {
+    must.push({
+      bool: {
+        should: [
+          { match: { title: { query: queryParams.keyword, boost: 2 } } },
+          { match: { id: { query: queryParams.keyword, boost: 1 } } },
+        ],
+      },
+    });
+  }
+  if (queryParams.severity) {
+    filter.push({ term: { severity: queryParams.severity } });
+  }
+
+  const body = {
+    query: must.length || filter.length
+      ? { bool: { must: must.length ? must : [{ match_all: {} }], filter } }
+      : { match_all: {} },
+    sort: [{ update_time: { order: 'desc' } }],
+    size: 200,
+  };
+
+  const result = await searchIndex('incident-index', body);
+  const hits = result.hits?.hits || [];
+  const items = hits.map((h) => mapIncidentToFrontend(h._source));
+
+  // Compute severity stats
+  const stats = { total: items.length, critical: 0, high: 0, medium: 0, low: 0 };
+  for (const item of items) {
+    if (stats[item.severity] !== undefined) stats[item.severity]++;
+  }
+
+  return { items, total: items.length, stats };
+}
+
+/**
+ * Get a single incident from ES by ID, mapped to frontend shape.
+ */
+async function getIncidentFromEs(id) {
+  const result = await searchIndex('incident-index', {
+    query: { term: { id } },
+    size: 1,
+  });
+  const hit = result.hits?.hits?.[0];
+  if (!hit) return null;
+  return mapIncidentToFrontend(hit._source);
+}
 
 // =============================================================================
 // ROUTER
@@ -748,60 +761,51 @@ const router = async (req, res) => {
       return json(res, 200, mapTaskToApi(rows[0]));
     }
 
-    // ── M3: Incidents (in-memory mock) ────────────────────────────────────
+    // ── M3: Incidents (ES-backed) ───────────────────────────────────────
     if (pathname === '/api/security/incidents' && method === 'GET') {
-      const items = listIncidents(urlQuery);
-      const stats = dictionaries.severities.reduce((acc, severity) => {
-        acc[severity.value] = incidents.filter((incident) => incident.severity === severity.value).length;
-        return acc;
-      }, { total: incidents.length });
-      return json(res, 200, { items, total: items.length, stats });
+      const data = await listIncidentsFromEs(urlQuery);
+      insertAuditLog({ action: 'list', targetType: 'incident', targetId: null, ipAddress: clientIp });
+      return json(res, 200, data);
     }
 
     if (pathname === '/api/security/incidents' && method === 'POST') {
       const body = await parseBody(req);
       const scene = body.sceneId ? await getAttackSceneById(body.sceneId) : null;
-      const severity = getSeverity(body.severity);
-      const incident = {
-        id: String(Math.floor(100000 + Math.random() * 900000)),
+      const severity = body.severity || 'low';
+      const now = new Date().toISOString();
+      const id = `inc-${randomUUID().slice(0, 8)}`;
+      const incidentDoc = {
+        id,
         title: body.title,
-        severity: body.severity,
-        severityLabel: severity?.label || '提醒',
-        attackResult: 'unknown',
-        attackResultLabel: '未知',
-        category: scene?.name || '',
-        dataSource: '人工创建',
+        severity,
+        attack_result: 'unknown',
+        scene_type: scene?.name || body.sceneId || '',
+        ice_rule_id: null,
+        data_source: '人工创建',
         organization: '总公司全局',
-        updatedAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
-        startTime: new Date().toISOString().slice(0, 19).replace('T', ' '),
-        endTime: new Date().toISOString().slice(0, 19).replace('T', ' '),
-        owner: body.owner || '-',
-        device: '-',
-        modelId: null,
-        modelName: '人工创建',
         advice: body.advice || '',
-        relatedLogIds: body.logIds || [],
-        entities: { ip: 0, host: 0, account: 0 },
-        alerts: (body.logIds || []).map((logId) => {
-          const log = logs.find((item) => item.id === logId);
-          return {
-            id: `manual-${logId}`,
-            startedAt: log?.occurredAt || '',
-            severityLabel: body.severity,
-            title: log?.eventName || '关联日志',
-            relation: '人工关联',
-            type: log?.eventLevel || '',
-            attacker: log?.sourceAddress || '',
-            victim: log?.destinationAddress || '',
-            tactic: '',
-            resultLabel: '未知',
-            core: false,
-            entry: true
-          };
-        })
+        start_time: now,
+        end_time: now,
+        update_time: now,
+        attacker_array: [],
+        victim_array: [],
+        priority: { critical: 4, high: 3, medium: 2, low: 1 }[severity] || 0,
+        threat_confidence: 0,
+        related_alerts: (body.logIds || []).map((logId) => ({
+          id: `manual-${logId}`,
+          title: '关联日志',
+          severity: '',
+          relation: '人工关联',
+          core: false,
+          entry: true,
+          started_at: now,
+        })),
+        graph: { nodes: [], edges: [] },
+        entities: { hosts: [], ips: [], accounts: [], files: [] },
       };
-      incidents.unshift(incident);
-      return json(res, 201, incident);
+      await indexDocument('incident-index', id, incidentDoc);
+      insertAuditLog({ action: 'create', targetType: 'incident', targetId: id, ipAddress: clientIp });
+      return json(res, 201, mapIncidentToFrontend(incidentDoc));
     }
 
     if (pathname === '/api/security/incidents/table-fields' && method === 'GET') {
@@ -810,7 +814,8 @@ const router = async (req, res) => {
 
     const incidentMatch = pathname.match(/^\/api\/security\/incidents\/([^/]+)(?:\/([^/]+))?$/);
     if (incidentMatch && method === 'GET') {
-      const incident = incidents.find((item) => item.id === incidentMatch[1]);
+      const incidentId = incidentMatch[1];
+      const incident = await getIncidentFromEs(incidentId);
       if (!incident) return json(res, 404, { message: '安全事件不存在' });
       const section = incidentMatch[2];
       if (!section) return json(res, 200, incident);
@@ -876,6 +881,23 @@ const router = async (req, res) => {
       }
 
       if (section === 'graph') {
+        // Prefer stored graph from searcher if available
+        if (incident.graph && incident.graph.nodes && incident.graph.nodes.length > 0) {
+          // Convert searcher graph format to frontend format
+          const graphNodes = incident.graph.nodes.map((n) => ({
+            id: n.id,
+            label: n.label || n.id,
+            type: n.type || 'unknown',
+            risk: n.data?.risk || '未知',
+          }));
+          const graphEdges = (incident.graph.edges || []).map((e) => ({
+            from: e.source || e.from,
+            to: e.target || e.to,
+            label: e.relationship || e.label || '',
+          }));
+          return json(res, 200, { nodes: graphNodes, edges: graphEdges });
+        }
+        // Fallback: build graph from alerts
         const graphNodes = [
           { id: incident.id, label: incident.title, type: '事件', risk: incident.severityLabel }
         ];
@@ -885,12 +907,12 @@ const router = async (req, res) => {
           if (!addedIds.has(id)) { addedIds.add(id); graphNodes.push({ id, label, type, risk }); }
         };
         incident.alerts.forEach((alert) => {
-          addNode(alert.id, alert.title, '告警', alert.severityLabel);
+          addNode(alert.id, alert.title, '告警', SEVERITY_LABEL_MAP[alert.severity] || alert.severity || '');
           graphEdges.push({ from: incident.id, to: alert.id, label: alert.relation });
         });
         const alertVictims = [...new Set(incident.alerts.map((a) => a.victim).filter(Boolean))];
         const alertAttackers = [...new Set(incident.alerts.map((a) => a.attacker).filter(Boolean))];
-        alertVictims.forEach((ip, i) => {
+        alertVictims.forEach((ip) => {
           const hostId = `host-${ip}`;
           addNode(hostId, `主机 ${ip}`, '主机', incident.severityLabel);
           incident.alerts.filter((a) => a.victim === ip).forEach((a) => {
@@ -907,81 +929,136 @@ const router = async (req, res) => {
             graphEdges.push({ from: extId, to: a.id, label: '攻击来源' });
           });
         });
-        if (incident.alerts.length > 0 && incident.alerts[0].victim) {
-          const accId = `acc-${incident.id}`;
-          addNode(accId, `admin_${incident.id.slice(-3)}`, '账号', '高风险');
-          graphEdges.push({ from: `ip-${incident.alerts[0].victim}`, to: accId, label: '登录' });
-        }
-        if (incident.alerts.some((a) => a.core)) {
-          const fileId = `file-${incident.id}`;
-          addNode(fileId, 'malware_sample.exe', '文件', '严重');
-          graphEdges.push({ from: `host-${(alertVictims[0] || 'unknown')}`, to: fileId, label: '感染' });
-        }
         return json(res, 200, { nodes: graphNodes, edges: graphEdges });
       }
 
       if (section === 'evidence') {
-        const hasAlerts = incident.alerts.length > 0;
+        // Query entity-index for real entities related to this incident
+        const entityResult = await searchIndex('entity-index', {
+          query: { term: { incident_id: incidentId } },
+          size: 100,
+        });
+        const entityHits = entityResult.hits?.hits || [];
+        const severityLabel = (s) => SEVERITY_LABEL_MAP[s] || s || '未知';
+
+        const fileEntities = entityHits
+          .filter((h) => h._source.type === 'file')
+          .map((h) => ({
+            md5: h._source.name,
+            name: h._source.name?.slice(0, 20) || 'unknown',
+            type: '文件',
+            risk: severityLabel(incident.severity),
+            detectedAt: h._source.first_seen || incident.startTime,
+            source: incident.dataSource,
+          }));
+
+        const ipEntities = entityHits
+          .filter((h) => h._source.type === 'ip')
+          .map((h) => ({
+            id: h._id,
+            indicator: h._source.name,
+            type: 'IP',
+            source: '系统检测',
+            confidence: '高',
+            matchedAt: h._source.first_seen || incident.startTime,
+          }));
+
         return json(res, 200, {
-          malware: hasAlerts ? incident.alerts.filter((a) => a.core).map((a, i) => ({
-            md5: `e3b0c44298fc1c149${String(i + 1).padStart(2, '0')}a7a3c6aa06a00ce43800${String(50 + i).padStart(2, '0')}8b0c64b50d05237e9c9fe6f3fb4274f9`,
-            name: a.title.replace(/检测到|病毒/g, '').trim().slice(0, 20) || `malware_${i + 1}.exe`,
-            type: a.type || '恶意程序',
-            risk: a.severityLabel || '严重',
-            detectedAt: a.startedAt,
-            source: incident.dataSource
-          })) : [{ md5: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', name: 'sample.exe', type: '其他', risk: '未知', detectedAt: incident.startTime, source: incident.dataSource }],
-          intelligence: hasAlerts ? [
-            { id: `intel-${incident.id}-1`, indicator: incident.alerts[0]?.victim || '10.0.0.1', type: 'IP', source: '微步在线', confidence: '高', matchedAt: incident.startTime },
-            { id: `intel-${incident.id}-2`, indicator: `malware_hash_${incident.id}`, type: '文件哈希', source: 'VirusTotal', confidence: '中', matchedAt: incident.startTime }
-          ] : [],
-          suspiciousFiles: hasAlerts ? [
-            { path: 'C:\\Windows\\Temp\\update.exe', md5: 'a1b2c3d4e5f678901234567890123456', size: '245KB', risk: '可疑', matchedAt: incident.startTime },
-            { path: 'C:\\Users\\Public\\svchost.exe', md5: 'f6e5d4c3b2a109876543210987654321', size: '1.2MB', risk: '高危', matchedAt: incident.startTime }
-          ] : []
+          malware: fileEntities.length > 0 ? fileEntities : [],
+          intelligence: ipEntities.length > 0 ? ipEntities : [],
+          suspiciousFiles: fileEntities,
         });
       }
 
       if (section === 'impact') {
-        const alertVictims = [...new Set(incident.alerts.map((a) => a.victim).filter(Boolean))];
-        const alertAttackers = [...new Set(incident.alerts.map((a) => a.attacker).filter(Boolean))];
+        // Query entity-index for real entities related to this incident
+        const entityResult = await searchIndex('entity-index', {
+          query: { term: { incident_id: incidentId } },
+          size: 100,
+        });
+        const entityHits = entityResult.hits?.hits || [];
+
+        const hostEntities = entityHits
+          .filter((h) => h._source.type === 'host')
+          .map((h) => ({
+            id: h._id,
+            name: h._source.name,
+            ip: h._source.name,
+            os: 'Unknown',
+            risk: h._source.risk || 'unknown',
+            compromised: h._source.compromised || 'unknown',
+            exposure: '-',
+            count: 1,
+            firstSeen: h._source.first_seen || incident.startTime,
+            lastSeen: h._source.last_seen || incident.endTime,
+          }));
+
+        const ipEntities = entityHits
+          .filter((h) => h._source.type === 'ip')
+          .map((h) => ({
+            id: h._id,
+            ip: h._source.name,
+            type: 'IP',
+            risk: h._source.risk || 'unknown',
+            owner: incident.organization || '-',
+            firstSeen: h._source.first_seen || incident.startTime,
+            lastSeen: h._source.last_seen || incident.endTime,
+            count: 1,
+          }));
+
+        const accountEntities = entityHits
+          .filter((h) => h._source.type === 'account')
+          .map((h) => ({
+            id: h._id,
+            name: h._source.name,
+            domain: '',
+            risk: h._source.risk || 'unknown',
+            compromised: h._source.compromised || 'unknown',
+            lastSeen: h._source.last_seen || incident.endTime,
+            count: 1,
+          }));
+
         return json(res, 200, {
-          hosts: alertVictims.length > 0 ? alertVictims.map((ip, i) => ({
-            id: `host-${String(i + 1).padStart(4, '0')}`,
-            name: `win-pc-${ip.split('.').pop()}`,
-            ip: ip,
-            os: 'Windows 10',
-            risk: incident.severity === 'critical' || incident.severity === 'high' ? '高风险' : '中风险',
-            compromised: i === 0 ? '已失陷' : '疑似失陷',
-            exposure: i === 0 ? '72小时' : '24小时',
-            count: 50 + i * 30,
-            firstSeen: incident.startTime,
-            lastSeen: incident.endTime
-          })) : [{ id: '894856-97cf', name: 'win7-2022moqete', ip: '10.239.194.26', os: 'Windows 7', risk: '无风险', compromised: '正常', exposure: '无', count: 191, firstSeen: '2026-05-28 08:51:54', lastSeen: incident.endTime }],
-          ips: alertVictims.length > 1 ? alertVictims.slice(1).map((ip, i) => ({
-            id: `ip-${String(i + 1).padStart(4, '0')}`,
-            ip: ip,
-            type: '内网IP',
-            risk: '中风险',
-            owner: '总公司全局',
-            firstSeen: incident.startTime,
-            lastSeen: incident.endTime,
-            count: 20 + i * 10
-          })) : [],
-          accounts: incident.alerts.length > 0 ? [
-            { id: `acc-${incident.id}-1`, name: `admin_${incident.id.slice(-3)}`, domain: 'PSBC', risk: '高风险', compromised: '已失陷', lastSeen: incident.endTime, count: 5 },
-            { id: `acc-${incident.id}-2`, name: `svc_backup`, domain: 'PSBC', risk: '中风险', compromised: '疑似失陷', lastSeen: incident.endTime, count: 2 }
-          ] : []
+          hosts: hostEntities,
+          ips: ipEntities,
+          accounts: accountEntities,
         });
       }
     }
 
-    // ── M3: Logs search (in-memory mock) ──────────────────────────────────
+    // ── M3: Logs search (ES-backed) ─────────────────────────────────────
     if (pathname === '/api/security/logs/search' && method === 'POST') {
       const body = await parseBody(req);
       const keyword = body.keyword || body.hql || '';
-      const items = logs.filter((log) => !keyword || JSON.stringify(log).includes(keyword.replaceAll('"', '')));
-      return json(res, 200, { items: items.slice(0, 20), total: items.length });
+      const must = [];
+      if (keyword) {
+        must.push({
+          multi_match: {
+            query: keyword,
+            fields: ['event_name^2', 'source_address', 'destination_address', 'organization', 'raw'],
+          },
+        });
+      }
+      const esBody = {
+        query: must.length ? { bool: { must } } : { match_all: {} },
+        sort: [{ occurred_at: { order: 'desc' } }],
+        size: 20,
+      };
+      const result = await searchIndex('log-index', esBody);
+      const hits = result.hits?.hits || [];
+      const items = hits.map((h) => ({
+        id: h._source.id,
+        occurredAt: h._source.occurred_at || '',
+        eventName: h._source.event_name || '',
+        eventLevel: h._source.event_level || '',
+        organization: h._source.organization || '',
+        sourceAddress: h._source.source_address || '',
+        destinationAddress: h._source.destination_address || '',
+        sourcePort: h._source.source_port || '',
+        destinationPort: h._source.destination_port || '',
+        raw: h._source.raw || '',
+      }));
+      return json(res, 200, { items, total: result.hits?.total?.value || items.length });
     }
 
     if (pathname === '/api/security/logs/templates' && method === 'GET') {

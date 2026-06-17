@@ -72,7 +72,7 @@ const logIndex = {
     mappings: {
       properties: {
         id:                  { type: 'keyword' },
-        event_name:          { type: 'keyword' },
+        event_name:          { type: 'text', fields: { keyword: { type: 'keyword' } } },
         event_level:         { type: 'keyword' },
         organization:        { type: 'keyword' },
         source_address:      { type: 'keyword' },
