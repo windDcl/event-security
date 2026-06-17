@@ -1,8 +1,24 @@
+// =============================================================================
+// event-security/server/index.js
+// HTTP API server integrating with PostgreSQL, Elasticsearch, Redis, Kafka.
+// Port 4173 · Host 127.0.0.1
+// =============================================================================
+
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { validateDsl as validateDslAdvanced, compileToStatement } from './services/dsl.js';
+
+import { initDb, query } from './db.js';
+import { initEs } from './es.js';
+import redisClient from './redis.js';
+import { ensureTopics } from './kafka.js';
+import { startAggregator } from './services/aggregator.js';
+import { startSearcher } from './services/searcher.js';
+
+// ── Paths & config ──────────────────────────────────────────────────────────
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -10,23 +26,9 @@ const publicDir = path.join(rootDir, 'public');
 const port = Number(process.env.PORT || 4173);
 const host = process.env.HOST || '127.0.0.1';
 
-const now = Date.now();
+// ── Mock data (in-memory until M17/M18) ─────────────────────────────────────
 
-const attackScenes = [
-  { id: 'scan', parentId: null, name: '扫描探测', sceneType: 'ndr', sceneModel: 'scenario' },
-  { id: 'host-abnormal', parentId: null, name: '主机异常', sceneType: 'xdr', sceneModel: 'scenario' },
-  { id: 'abnormal-comm', parentId: null, name: '异常通信', sceneType: 'xdr', sceneModel: 'scenario' },
-  { id: 'vuln-attack', parentId: null, name: '漏洞攻击', sceneType: 'ndr', sceneModel: 'scenario' },
-  { id: 'remote-control', parentId: null, name: '远控操控', sceneType: 'xdr', sceneModel: 'scenario' },
-  { id: 'web-attack', parentId: null, name: 'Web攻击', sceneType: 'ndr', sceneModel: 'scenario' },
-  { id: 'network-attack', parentId: null, name: '网络攻击', sceneType: 'ndr', sceneModel: 'scenario' },
-  { id: 'account-abnormal', parentId: null, name: '账号异常', sceneType: 'xdr', sceneModel: 'scenario' },
-  { id: 'threat-intel', parentId: null, name: '威胁情报', sceneType: 'xdr', sceneModel: 'scenario' },
-  { id: 'mail-attack', parentId: null, name: '邮件攻击', sceneType: 'xdr', sceneModel: 'scenario' },
-  { id: 'multi-correlation', parentId: null, name: '多维关联', sceneType: 'xdr', sceneModel: 'scenario' },
-  { id: 'content-security', parentId: null, name: '内容安全', sceneType: 'xdr', sceneModel: 'scenario' },
-  { id: 'malware', parentId: null, name: '恶意程序', sceneType: 'xdr', sceneModel: 'scenario' }
-];
+const now = Date.now();
 
 const dictionaries = {
   severities: [
@@ -51,61 +53,7 @@ const dictionaries = {
   ]
 };
 
-const defaultDsl = `processList:
-  - condition: 主机IP = "\${主机IP}" and 文件MD5 = "\${文件MD5}"
-    source: "告警"
-    time: ["-5h", "1h"]
-    relationship: "相同的病毒"
-  - condition: 目的地址 = "\${源地址}" or 主机IP = "\${主机IP}"
-    source: "日志"
-    time: ["-1h", "12h"]
-    relationship: "相同的受害者地址"`;
-
-let models = [
-  {
-    id: 'model-001',
-    name: '安全设备检测到主机上登录异常',
-    description: '将主机异常登录相关告警聚合为安全事件。',
-    sceneId: 'host-abnormal',
-    sceneName: '主机异常',
-    source: 'custom',
-    sourceLabel: '自定义模型',
-    status: 'running',
-    entryAlerts: [
-      { key: 'A', condition: '关联分析规则名称 = "安全设备检测到主机上登录异常"' }
-    ],
-    dsl: defaultDsl,
-    active: true,
-    notifier: '',
-    useEntryAlertNameAsTitle: false,
-    updatedAt: '2026-06-09 15:33:43',
-    history: [
-      { time: '2026-06-09 15:33:43', content: '模型更新' },
-      { time: '2026-05-29 09:20:12', content: '模型创建' }
-    ]
-  },
-  {
-    id: 'model-002',
-    name: '[场景模型]主机上大量文件感染病毒_优化',
-    description: '发现主机大量文件感染病毒时聚合相关告警和证据。',
-    sceneId: 'malware',
-    sceneName: '恶意程序',
-    source: 'custom',
-    sourceLabel: '自定义模型',
-    status: 'running',
-    entryAlerts: [
-      { key: 'A', condition: '告警名称 like "病毒爆发" and 威胁鉴定结果 != "无风险"' }
-    ],
-    dsl: defaultDsl,
-    active: true,
-    notifier: '',
-    useEntryAlertNameAsTitle: true,
-    updatedAt: '2026-06-15 12:33:51',
-    history: [
-      { time: '2026-06-15 12:33:51', content: '入口告警更新' }
-    ]
-  }
-];
+const defaultDsl = `processList:\n  - condition: 主机IP = \"\${主机IP}\" and 文件MD5 = \"\${文件MD5}\"\n    source: \"告警\"\n    time: [\"-5h\", \"1h\"]\n    relationship: \"相同的病毒\"\n  - condition: 目的地址 = \"\${源地址}\" or 主机IP = \"\${主机IP}\"\n    source: \"日志\"\n    time: [\"-1h\", \"12h\"]\n    relationship: \"相同的受害者地址\"`;
 
 let logs = Array.from({ length: 36 }).map((_, index) => ({
   id: `log-${String(index + 1).padStart(3, '0')}`,
@@ -208,6 +156,8 @@ const tableFields = [
   { key: 'updatedAt', label: '更新时间', visible: true }
 ];
 
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
 const json = (res, status, data) => {
   const body = JSON.stringify(data);
   res.writeHead(status, {
@@ -224,27 +174,216 @@ const parseBody = async (req) => {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 };
 
-const getScene = (sceneId) => attackScenes.find((scene) => scene.id === sceneId);
-const getSeverity = (severity) => dictionaries.severities.find((item) => item.value === severity);
+const getSeverity = (severity) =>
+  dictionaries.severities.find((item) => item.value === severity);
 
-const listModels = (query) => {
-  return models.filter((model) => {
-    if (query.sceneId && model.sceneId !== query.sceneId) return false;
-    if (query.status && model.status !== query.status) return false;
-    if (query.source && model.source !== query.source) return false;
-    if (query.keyword && !`${model.name} ${model.description}`.includes(query.keyword)) return false;
-    return true;
-  });
+// ── Audit logging ───────────────────────────────────────────────────────────
+
+const AUDIT_ACTIONS = {
+  CREATE: 'create',
+  UPDATE: 'update',
+  DELETE: 'delete',
+  IMPORT: 'import',
+  ENABLE: 'enable',
+  DISABLE: 'disable',
 };
 
-const listIncidents = (query) => {
-  return incidents.filter((incident) => {
-    if (query.keyword && !`${incident.title} ${incident.id}`.includes(query.keyword)) return false;
-    if (query.severity && incident.severity !== query.severity) return false;
-    if (query.category && incident.category !== query.category) return false;
-    return true;
-  });
-};
+async function insertAuditLog({ action, targetType, targetId, detail, userName, ipAddress }) {
+  try {
+    await query(
+      `INSERT INTO audit_log (action, target_type, target_id, detail, user_name, ip_address)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [action, targetType, targetId || '', detail || '', userName || 'system', ipAddress || '']
+    );
+  } catch (err) {
+    console.error('[audit] insertAuditLog error:', err.message);
+  }
+}
+
+// ── PG helpers: attack scenes ───────────────────────────────────────────────
+
+async function getAttackScenesFromDb() {
+  const { rows } = await query('SELECT id, parent_id AS "parentId", name, scene_type AS "sceneType", scene_model AS "sceneModel" FROM attack_scene ORDER BY id');
+  return rows;
+}
+
+async function getAttackSceneById(sceneId) {
+  const { rows } = await query('SELECT id, parent_id AS "parentId", name, scene_type AS "sceneType", scene_model AS "sceneModel" FROM attack_scene WHERE id = $1', [sceneId]);
+  return rows[0] || null;
+}
+
+// ── PG helpers: models (ice_rule) ───────────────────────────────────────────
+
+/**
+ * Map a PG ice_rule row to the API model shape.
+ */
+function mapRuleToModel(row) {
+  let entryAlerts = [];
+  try { entryAlerts = row.raw ? JSON.parse(row.raw) : []; } catch { /* ignore */ }
+
+  return {
+    id: row.id,
+    name: row.name || '',
+    description: row.description || '',
+    sceneId: row.scene_type || '',
+    sceneName: '', // will be resolved separately if needed
+    source: row.source || 'custom',
+    sourceLabel: row.system ? '系统内置' : (row.source === 'imported' ? '导入模型' : '自定义模型'),
+    status: row.status || 'stopped',
+    entryAlerts,
+    dsl: row.statement || '',
+    active: row.status === 'running',
+    notifier: row.notifier || '',
+    useEntryAlertNameAsTitle: false,
+    advice: row.advice || '',
+    updatedAt: row.update_time
+      ? new Date(row.update_time).toISOString().slice(0, 19).replace('T', ' ')
+      : '',
+    version: row.version || 1,
+    history: [] // populated separately
+  };
+}
+
+/**
+ * Map an API model body to PG ice_rule columns for INSERT.
+ */
+function mapBodyToRuleInsert(body, id) {
+  return {
+    id,
+    name: body.name || '',
+    description: body.description || '',
+    advice: body.advice || '',
+    scene_type: body.sceneId || null,
+    notifier: body.notifier || '',
+    status: body.active !== undefined ? (body.active ? 'running' : 'stopped') : 'stopped',
+    source: body.source || 'custom',
+    statement: body.dsl || '',
+    raw: JSON.stringify(body.entryAlerts || []),
+    system: false,
+    logic_delete: false,
+    version: 1,
+  };
+}
+
+/**
+ * Map an API model body to PG ice_rule columns for UPDATE.
+ */
+function mapBodyToRuleUpdate(body) {
+  const sets = [];
+  const vals = [];
+  let idx = 1;
+
+  const push = (col, val) => {
+    sets.push(`${col} = $${idx++}`);
+    vals.push(val);
+  };
+
+  if (body.name !== undefined) push('name', body.name);
+  if (body.description !== undefined) push('description', body.description);
+  if (body.advice !== undefined) push('advice', body.advice);
+  if (body.sceneId !== undefined) push('scene_type', body.sceneId);
+  if (body.notifier !== undefined) push('notifier', body.notifier);
+  if (body.active !== undefined) push('status', body.active ? 'running' : 'stopped');
+  if (body.source !== undefined) push('source', body.source);
+  if (body.dsl !== undefined) push('statement', body.dsl);
+  if (body.entryAlerts !== undefined) push('raw', JSON.stringify(body.entryAlerts));
+
+  push('update_time', 'NOW()');
+
+  // Bump version on update
+  sets.push(`version = version + 1`);
+
+  return { sets, vals };
+}
+
+async function listModelsFromDb(filters) {
+  const conditions = ['logic_delete = false'];
+  const params = [];
+  let idx = 1;
+
+  if (filters.sceneId) {
+    conditions.push(`scene_type = $${idx++}`);
+    params.push(filters.sceneId);
+  }
+  if (filters.status) {
+    conditions.push(`status = $${idx++}`);
+    params.push(filters.status);
+  }
+  if (filters.source) {
+    conditions.push(`source = $${idx++}`);
+    params.push(filters.source);
+  }
+  if (filters.keyword) {
+    conditions.push(`(name ILIKE $${idx} OR description ILIKE $${idx})`);
+    params.push(`%${filters.keyword}%`);
+    idx++;
+  }
+
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const { rows } = await query(`SELECT * FROM ice_rule ${where} ORDER BY update_time DESC`, params);
+  return rows.map(mapRuleToModel);
+}
+
+async function getModelFromDb(id) {
+  const { rows } = await query('SELECT * FROM ice_rule WHERE id = $1 AND logic_delete = false', [id]);
+  return rows[0] ? mapRuleToModel(rows[0]) : null;
+}
+
+async function getModelHistoryFromDb(id) {
+  // Use ice_analysis_task for history, falling back to version-based history
+  try {
+    const { rows } = await query(
+      `SELECT name, description, create_time AS time, status
+       FROM ice_analysis_task
+       WHERE relative_ids LIKE $1
+       ORDER BY create_time DESC`,
+      [`%${id}%`]
+    );
+    if (rows.length > 0) {
+      return rows.map((r) => ({
+        time: r.time ? new Date(r.time).toISOString().slice(0, 19).replace('T', ' ') : '',
+        content: r.name || r.description || '任务'
+      }));
+    }
+  } catch {
+    // Table may not have matching rows — fall through to version history
+  }
+
+  // Fallback: synthetic version history from the model itself
+  const model = await getModelFromDb(id);
+  if (!model) return [];
+  return model.history && model.history.length > 0
+    ? model.history
+    : [{ time: model.updatedAt, content: '模型更新' }];
+}
+
+// ── Analysis task DB helpers ────────────────────────────────────────────────
+
+function mapTaskToApi(row) {
+  return {
+    id: row.id,
+    name: row.name || '',
+    description: row.description || '',
+    notifier: row.notifier || '',
+    status: row.status,
+    progress: row.progress,
+    relativeIds: row.relative_ids ? row.relative_ids.split(',').filter(Boolean) : [],
+    relativeRules: row.relative_rules ? row.relative_rules.split(',').filter(Boolean) : [],
+    relativeType: row.relative_type,
+    finishIds: row.finish_ids ? row.finish_ids.split(',').filter(Boolean) : [],
+    userId: row.user_id || '',
+    createTime: row.create_time ? new Date(row.create_time).toISOString().slice(0, 19).replace('T', ' ') : '',
+    updateTime: row.update_time ? new Date(row.update_time).toISOString().slice(0, 19).replace('T', ' ') : '',
+  };
+}
+
+// ── DSL validation helper ───────────────────────────────────────────────────
+
+function validateDsl(dsl) {
+  return Boolean(dsl && dsl.includes('processList'));
+}
+
+// ── Static file server ─────────────────────────────────────────────────────
 
 const sendStatic = (req, res, pathname) => {
   const relativePath = pathname === '/' ? 'index.html' : pathname.slice(1);
@@ -270,96 +409,358 @@ const sendStatic = (req, res, pathname) => {
   fs.createReadStream(filePath).pipe(res);
 };
 
+// ── In-memory filter helpers (for mock data) ────────────────────────────────
+
+const listIncidents = (query) => {
+  return incidents.filter((incident) => {
+    if (query.keyword && !`${incident.title} ${incident.id}`.includes(query.keyword)) return false;
+    if (query.severity && incident.severity !== query.severity) return false;
+    if (query.category && incident.category !== query.category) return false;
+    return true;
+  });
+};
+
+// =============================================================================
+// ROUTER
+// =============================================================================
+
 const router = async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
-  const query = Object.fromEntries(url.searchParams.entries());
+  const urlQuery = Object.fromEntries(url.searchParams.entries());
+  const method = req.method;
+  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
 
   try {
-    if (pathname === '/api/security/dictionaries' && req.method === 'GET') {
-      return json(res, 200, dictionaries);
+    // ── M20: Audit Logs ────────────────────────────────────────────────────
+    if (pathname === '/api/security/audit-logs' && method === 'GET') {
+      const page = Math.max(1, parseInt(urlQuery.page || '1', 10));
+      const pageSize = Math.min(100, Math.max(1, parseInt(urlQuery.pageSize || '20', 10)));
+      const offset = (page - 1) * pageSize;
+
+      const conditions = [];
+      const params = [];
+      let idx = 1;
+
+      if (urlQuery.action) {
+        conditions.push(`action = $${idx++}`);
+        params.push(urlQuery.action);
+      }
+      if (urlQuery.targetType) {
+        conditions.push(`target_type = $${idx++}`);
+        params.push(urlQuery.targetType);
+      }
+      if (urlQuery.targetId) {
+        conditions.push(`target_id = $${idx++}`);
+        params.push(urlQuery.targetId);
+      }
+
+      const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+      const countResult = await query(`SELECT COUNT(*)::int AS total FROM audit_log ${where}`, params);
+      const total = countResult.rows[0]?.total || 0;
+
+      params.push(pageSize);
+      params.push(offset);
+      const { rows } = await query(
+        `SELECT id, action, target_type AS "targetType", target_id AS "targetId",
+                detail, user_name AS "userName", ip_address AS "ipAddress",
+                create_time AS "createTime"
+         FROM audit_log ${where}
+         ORDER BY id DESC
+         LIMIT $${idx++} OFFSET $${idx++}`,
+        params
+      );
+
+      return json(res, 200, { items: rows, total, page, pageSize });
     }
-    if (pathname === '/api/security/attack-scenes/tree' && req.method === 'GET') {
-      return json(res, 200, attackScenes);
+
+    // ── M19: Export model ──────────────────────────────────────────────────
+    if (pathname === '/api/security/models/export' && method === 'GET') {
+      const modelId = urlQuery.id;
+      if (!modelId) return json(res, 400, { message: '缺少模型 id 参数' });
+
+      const model = await getModelFromDb(modelId);
+      if (!model) return json(res, 404, { message: '模型不存在' });
+
+      const exportPayload = JSON.stringify(model, null, 2);
+      const filename = `model-${modelId}.json`;
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length': Buffer.byteLength(exportPayload)
+      });
+      return res.end(exportPayload);
     }
-    if (pathname === '/api/security/models' && req.method === 'GET') {
-      return json(res, 200, { items: listModels(query), total: listModels(query).length });
-    }
-    if (pathname === '/api/security/models' && req.method === 'POST') {
+
+    // ── M19: Import model ──────────────────────────────────────────────────
+    if (pathname === '/api/security/models/import' && method === 'POST') {
       const body = await parseBody(req);
-      const scene = getScene(body.sceneId);
-      const model = {
-        id: randomUUID(),
-        name: body.name,
-        description: body.description || '',
-        sceneId: body.sceneId,
-        sceneName: scene?.name || '',
-        source: 'custom',
-        sourceLabel: '自定义模型',
-        status: body.active ? 'running' : 'stopped',
-        entryAlerts: body.entryAlerts || [],
-        dsl: body.dsl || '',
-        active: Boolean(body.active),
-        notifier: body.notifier || '',
-        useEntryAlertNameAsTitle: Boolean(body.useEntryAlertNameAsTitle),
-        updatedAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
-        history: [{ time: new Date().toISOString().slice(0, 19).replace('T', ' '), content: '模型创建' }]
-      };
-      models.unshift(model);
+
+      // Validate required fields
+      if (!body.name) return json(res, 400, { message: '缺少模型名称' });
+      if (!validateDsl(body.dsl)) return json(res, 400, { message: 'DSL 必须包含 processList' });
+
+      const id = randomUUID();
+      const rule = mapBodyToRuleInsert({ ...body, source: 'imported' }, id);
+
+      await query(
+        `INSERT INTO ice_rule (id, name, description, advice, scene_type, notifier, status, source, statement, raw, system, logic_delete, version)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+        [rule.id, rule.name, rule.description, rule.advice, rule.scene_type, rule.notifier, rule.status, rule.source, rule.statement, rule.raw, rule.system, rule.logic_delete, rule.version]
+      );
+
+      const scene = body.sceneId ? await getAttackSceneById(body.sceneId) : null;
+      const model = mapRuleToModel(rule);
+      model.sceneName = scene?.name || '';
+      model.history = [{ time: model.updatedAt || new Date().toISOString().slice(0, 19).replace('T', ' '), content: '模型导入' }];
+
+      await insertAuditLog({
+        action: AUDIT_ACTIONS.IMPORT,
+        targetType: 'model',
+        targetId: id,
+        detail: `导入模型: ${rule.name}`,
+        ipAddress: clientIp
+      });
+
       return json(res, 201, model);
     }
-    const modelMatch = pathname.match(/^\/api\/security\/models\/([^/]+)$/);
-    if (modelMatch && req.method === 'GET') {
-      const model = models.find((item) => item.id === modelMatch[1]);
-      return model ? json(res, 200, model) : json(res, 404, { message: '模型不存在' });
+
+    // ── M3: Dictionaries ───────────────────────────────────────────────────
+    if (pathname === '/api/security/dictionaries' && method === 'GET') {
+      return json(res, 200, dictionaries);
     }
-    if (modelMatch && req.method === 'PUT') {
+
+    // ── M3: Attack scenes (from PG) ───────────────────────────────────────
+    if (pathname === '/api/security/attack-scenes/tree' && method === 'GET') {
+      const scenes = await getAttackScenesFromDb();
+      return json(res, 200, scenes);
+    }
+
+    // ── M3: List models (from PG) ─────────────────────────────────────────
+    if (pathname === '/api/security/models' && method === 'GET') {
+      const items = await listModelsFromDb(urlQuery);
+      // Resolve scene names
+      for (const item of items) {
+        if (item.sceneId) {
+          const scene = await getAttackSceneById(item.sceneId);
+          item.sceneName = scene?.name || '';
+        }
+      }
+      return json(res, 200, { items, total: items.length });
+    }
+
+    // ── M4: Create model (to PG) ──────────────────────────────────────────
+    if (pathname === '/api/security/models' && method === 'POST') {
       const body = await parseBody(req);
-      const index = models.findIndex((item) => item.id === modelMatch[1]);
-      if (index === -1) return json(res, 404, { message: '模型不存在' });
-      const scene = getScene(body.sceneId);
-      models[index] = {
-        ...models[index],
-        ...body,
-        sceneName: scene?.name || models[index].sceneName,
-        status: body.active ? 'running' : 'stopped',
-        updatedAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
-        history: [{ time: new Date().toISOString().slice(0, 19).replace('T', ' '), content: '模型更新' }, ...models[index].history]
-      };
-      return json(res, 200, models[index]);
+
+      if (!body.name) return json(res, 400, { message: '缺少模型名称' });
+      if (!validateDsl(body.dsl)) return json(res, 400, { message: 'DSL 必须包含 processList' });
+
+      const id = randomUUID();
+      const rule = mapBodyToRuleInsert(body, id);
+
+      await query(
+        `INSERT INTO ice_rule (id, name, description, advice, scene_type, notifier, status, source, statement, raw, system, logic_delete, version)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+        [rule.id, rule.name, rule.description, rule.advice, rule.scene_type, rule.notifier, rule.status, rule.source, rule.statement, rule.raw, rule.system, rule.logic_delete, rule.version]
+      );
+
+      const scene = body.sceneId ? await getAttackSceneById(body.sceneId) : null;
+      const model = mapRuleToModel(rule);
+      model.sceneName = scene?.name || '';
+      model.history = [{ time: model.updatedAt || new Date().toISOString().slice(0, 19).replace('T', ' '), content: '模型创建' }];
+
+      await insertAuditLog({
+        action: AUDIT_ACTIONS.CREATE,
+        targetType: 'model',
+        targetId: id,
+        detail: `创建模型: ${rule.name}`,
+        ipAddress: clientIp
+      });
+
+      return json(res, 201, model);
     }
-    if (modelMatch && req.method === 'DELETE') {
-      models = models.filter((item) => item.id !== modelMatch[1]);
-      return json(res, 200, { ok: true });
-    }
-    const modelActionMatch = pathname.match(/^\/api\/security\/models\/([^/]+)\/(enable|disable|history)$/);
-    if (modelActionMatch) {
-      const model = models.find((item) => item.id === modelActionMatch[1]);
-      if (!model) return json(res, 404, { message: '模型不存在' });
-      if (modelActionMatch[2] === 'history' && req.method === 'GET') return json(res, 200, model.history);
-      if (req.method === 'POST') {
-        model.status = modelActionMatch[2] === 'enable' ? 'running' : 'stopped';
-        model.active = model.status === 'running';
-        model.updatedAt = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+    // ── M3/M4: Model by ID (GET / PUT / DELETE) ────────────────────────────
+    const modelMatch = pathname.match(/^\/api\/security\/models\/([^/]+)$/);
+
+    if (modelMatch && !['enable', 'disable', 'history', 'validate', 'export', 'import'].includes(modelMatch[1])) {
+      const modelId = modelMatch[1];
+
+      if (method === 'GET') {
+        const model = await getModelFromDb(modelId);
+        if (!model) return json(res, 404, { message: '模型不存在' });
+        if (model.sceneId) {
+          const scene = await getAttackSceneById(model.sceneId);
+          model.sceneName = scene?.name || '';
+        }
         return json(res, 200, model);
       }
+
+      if (method === 'PUT') {
+        const body = await parseBody(req);
+        const existing = await getModelFromDb(modelId);
+        if (!existing) return json(res, 404, { message: '模型不存在' });
+
+        const { sets, vals } = mapBodyToRuleUpdate(body);
+        if (sets.length > 1) {
+          // sets already includes update_time and version bump
+          vals.push(modelId);
+          await query(`UPDATE ice_rule SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals);
+        }
+
+        const updated = await getModelFromDb(modelId);
+        if (updated.sceneId) {
+          const scene = await getAttackSceneById(updated.sceneId);
+          updated.sceneName = scene?.name || '';
+        }
+
+        await insertAuditLog({
+          action: AUDIT_ACTIONS.UPDATE,
+          targetType: 'model',
+          targetId: modelId,
+          detail: `更新模型: ${updated.name}`,
+          ipAddress: clientIp
+        });
+
+        return json(res, 200, updated);
+      }
+
+      if (method === 'DELETE') {
+        const existing = await getModelFromDb(modelId);
+        if (!existing) return json(res, 404, { message: '模型不存在' });
+
+        // Soft delete
+        await query(
+          'UPDATE ice_rule SET logic_delete = true, update_time = NOW() WHERE id = $1',
+          [modelId]
+        );
+
+        await insertAuditLog({
+          action: AUDIT_ACTIONS.DELETE,
+          targetType: 'model',
+          targetId: modelId,
+          detail: `删除模型: ${existing.name}`,
+          ipAddress: clientIp
+        });
+
+        return json(res, 200, { ok: true });
+      }
     }
-    if (pathname === '/api/security/models/validate' && req.method === 'POST') {
+
+    // ── M3/M4: Model actions (enable / disable / history) ─────────────────
+    const modelActionMatch = pathname.match(/^\/api\/security\/models\/([^/]+)\/(enable|disable|history)$/);
+    if (modelActionMatch) {
+      const modelId = modelActionMatch[1];
+      const action = modelActionMatch[2];
+
+      const existing = await getModelFromDb(modelId);
+      if (!existing) return json(res, 404, { message: '模型不存在' });
+
+      if (action === 'history' && method === 'GET') {
+        const history = await getModelHistoryFromDb(modelId);
+        return json(res, 200, history);
+      }
+
+      if (method === 'POST') {
+        const newStatus = action === 'enable' ? 'running' : 'stopped';
+        await query(
+          'UPDATE ice_rule SET status = $1, update_time = NOW() WHERE id = $2',
+          [newStatus, modelId]
+        );
+
+        const updated = await getModelFromDb(modelId);
+        if (updated.sceneId) {
+          const scene = await getAttackSceneById(updated.sceneId);
+          updated.sceneName = scene?.name || '';
+        }
+
+        await insertAuditLog({
+          action: action === 'enable' ? AUDIT_ACTIONS.ENABLE : AUDIT_ACTIONS.DISABLE,
+          targetType: 'model',
+          targetId: modelId,
+          detail: `${action === 'enable' ? '启用' : '停用'}模型: ${existing.name}`,
+          ipAddress: clientIp
+        });
+
+        return json(res, 200, updated);
+      }
+    }
+
+    // ── M16: Validate DSL ─────────────────────────────────────────────────
+    if (pathname === '/api/security/models/validate' && method === 'POST') {
       const body = await parseBody(req);
-      const ok = Boolean(body.dsl && body.dsl.includes('processList'));
-      return json(res, ok ? 200 : 400, ok ? { ok: true } : { message: 'DSL 必须包含 processList' });
+      const result = validateDslAdvanced(body.dsl);
+      if (result.valid) {
+        return json(res, 200, {
+          ok: true,
+          variables: result.variables,
+          stepCount: result.stepCount,
+          compiled: result.compiled
+        });
+      }
+      return json(res, 400, { message: result.errors.join('; ') });
     }
-    if (pathname === '/api/security/incidents' && req.method === 'GET') {
-      const items = listIncidents(query);
+
+    // ── Analysis tasks for incident (list / create) ──────────────────────
+    const analysisTasksListMatch = pathname.match(/^\/api\/security\/incidents\/([^/]+)\/analysis-tasks$/);
+    if (analysisTasksListMatch) {
+      const incidentId = analysisTasksListMatch[1];
+
+      if (method === 'GET') {
+        const { rows } = await query(
+          `SELECT * FROM ice_analysis_task WHERE ($1 = ANY(string_to_array(relative_ids, ','))) ORDER BY create_time DESC`,
+          [incidentId]
+        );
+        return json(res, 200, { items: rows.map(mapTaskToApi), total: rows.length });
+      }
+
+      if (method === 'POST') {
+        const body = await parseBody(req);
+        const taskId = randomUUID();
+        await query(
+          `INSERT INTO ice_analysis_task (id, name, description, notifier, status, relative_rules, relative_ids, relative_type, user_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            taskId,
+            body.name || '分析任务',
+            body.description || '',
+            body.notifier || '',
+            0,
+            (body.relativeRules || []).join(','),
+            [incidentId, ...(body.additionalIds || [])].join(','),
+            body.relativeType || 0,
+            body.userId || ''
+          ]
+        );
+        const { rows } = await query('SELECT * FROM ice_analysis_task WHERE id = $1', [taskId]);
+        return json(res, 201, mapTaskToApi(rows[0]));
+      }
+    }
+
+    // ── Analysis task for incident (single task status) ───────────────────
+    const analysisTaskSingleMatch = pathname.match(/^\/api\/security\/incidents\/([^/]+)\/analysis-tasks\/([^/]+)$/);
+    if (analysisTaskSingleMatch && method === 'GET') {
+      const taskId = analysisTaskSingleMatch[2];
+      const { rows } = await query('SELECT * FROM ice_analysis_task WHERE id = $1', [taskId]);
+      if (!rows.length) return json(res, 404, { message: '分析任务不存在' });
+      return json(res, 200, mapTaskToApi(rows[0]));
+    }
+
+    // ── M3: Incidents (in-memory mock) ────────────────────────────────────
+    if (pathname === '/api/security/incidents' && method === 'GET') {
+      const items = listIncidents(urlQuery);
       const stats = dictionaries.severities.reduce((acc, severity) => {
         acc[severity.value] = incidents.filter((incident) => incident.severity === severity.value).length;
         return acc;
       }, { total: incidents.length });
       return json(res, 200, { items, total: items.length, stats });
     }
-    if (pathname === '/api/security/incidents' && req.method === 'POST') {
+
+    if (pathname === '/api/security/incidents' && method === 'POST') {
       const body = await parseBody(req);
-      const scene = getScene(body.sceneId);
+      const scene = body.sceneId ? await getAttackSceneById(body.sceneId) : null;
       const severity = getSeverity(body.severity);
       const incident = {
         id: String(Math.floor(100000 + Math.random() * 900000)),
@@ -402,15 +803,18 @@ const router = async (req, res) => {
       incidents.unshift(incident);
       return json(res, 201, incident);
     }
-    if (pathname === '/api/security/incidents/table-fields' && req.method === 'GET') {
+
+    if (pathname === '/api/security/incidents/table-fields' && method === 'GET') {
       return json(res, 200, tableFields);
     }
+
     const incidentMatch = pathname.match(/^\/api\/security\/incidents\/([^/]+)(?:\/([^/]+))?$/);
-    if (incidentMatch && req.method === 'GET') {
+    if (incidentMatch && method === 'GET') {
       const incident = incidents.find((item) => item.id === incidentMatch[1]);
       if (!incident) return json(res, 404, { message: '安全事件不存在' });
       const section = incidentMatch[2];
       if (!section) return json(res, 200, incident);
+
       if (section === 'overview') {
         const alertCount = incident.alerts.length;
         const coreCount = incident.alerts.filter((a) => a.core).length;
@@ -462,11 +866,15 @@ const router = async (req, res) => {
           evidence: {
             intelligence: incident.alerts.length > 0 ? Math.min(incident.alerts.length, 3) : 0,
             malware: coreCount > 0 ? coreCount : 0,
-            suspiciousFile: incident.alerts.length * 5
+            suspiciousFiles: incident.alerts.length * 5
           }
         });
       }
-      if (section === 'alerts') return json(res, 200, { items: incident.alerts, total: incident.alerts.length });
+
+      if (section === 'alerts') {
+        return json(res, 200, { items: incident.alerts, total: incident.alerts.length });
+      }
+
       if (section === 'graph') {
         const graphNodes = [
           { id: incident.id, label: incident.title, type: '事件', risk: incident.severityLabel }
@@ -511,6 +919,7 @@ const router = async (req, res) => {
         }
         return json(res, 200, { nodes: graphNodes, edges: graphEdges });
       }
+
       if (section === 'evidence') {
         const hasAlerts = incident.alerts.length > 0;
         return json(res, 200, {
@@ -532,6 +941,7 @@ const router = async (req, res) => {
           ] : []
         });
       }
+
       if (section === 'impact') {
         const alertVictims = [...new Set(incident.alerts.map((a) => a.victim).filter(Boolean))];
         const alertAttackers = [...new Set(incident.alerts.map((a) => a.attacker).filter(Boolean))];
@@ -565,17 +975,22 @@ const router = async (req, res) => {
         });
       }
     }
-    if (pathname === '/api/security/logs/search' && req.method === 'POST') {
+
+    // ── M3: Logs search (in-memory mock) ──────────────────────────────────
+    if (pathname === '/api/security/logs/search' && method === 'POST') {
       const body = await parseBody(req);
       const keyword = body.keyword || body.hql || '';
       const items = logs.filter((log) => !keyword || JSON.stringify(log).includes(keyword.replaceAll('"', '')));
       return json(res, 200, { items: items.slice(0, 20), total: items.length });
     }
-    if (pathname === '/api/security/logs/templates' && req.method === 'GET') {
+
+    if (pathname === '/api/security/logs/templates' && method === 'GET') {
       return json(res, 200, [
         { id: 'default', name: '日志检索模板', fields: ['occurredAt', 'eventName', 'eventLevel', 'organization', 'sourceAddress', 'destinationAddress'] }
       ]);
     }
+
+    // ── Static files & SPA fallback ────────────────────────────────────────
     return sendStatic(req, res, pathname);
   } catch (error) {
     console.error(error);
@@ -583,6 +998,56 @@ const router = async (req, res) => {
   }
 };
 
-http.createServer(router).listen(port, host, () => {
-  console.log(`event-security listening on http://${host}:${port}`);
-});
+// =============================================================================
+// INITIALIZATION & STARTUP
+// =============================================================================
+
+async function start() {
+  try {
+    // 1. Initialize PostgreSQL (create tables, seed data)
+    console.log('[server] Initializing database...');
+    await initDb();
+
+    // 2. Initialize Elasticsearch (create indices)
+    console.log('[server] Initializing Elasticsearch...');
+    try {
+      await initEs();
+    } catch (err) {
+      console.error('[server] Elasticsearch init failed (non-fatal):', err.message);
+    }
+
+    // 3. Ensure Kafka topics exist
+    console.log('[server] Ensuring Kafka topics...');
+    try {
+      await ensureTopics();
+    } catch (err) {
+      console.error('[server] Kafka topic creation failed (non-fatal):', err.message);
+    }
+
+    // 4. Start event aggregator (Kafka consumer)
+    try {
+      await startAggregator();
+      console.log('[server] Aggregator started');
+    } catch (err) {
+      console.error('[server] Aggregator start failed (non-fatal):', err.message);
+    }
+
+    // 5. Start log searcher (Kafka consumer)
+    try {
+      await startSearcher();
+      console.log('[server] Searcher started');
+    } catch (err) {
+      console.error('[server] Searcher start failed (non-fatal):', err.message);
+    }
+
+    // 6. Start HTTP server
+    http.createServer(router).listen(port, host, () => {
+      console.log(`[server] event-security listening on http://${host}:${port}`);
+    });
+  } catch (err) {
+    console.error('[server] Fatal startup error:', err);
+    process.exit(1);
+  }
+}
+
+start();

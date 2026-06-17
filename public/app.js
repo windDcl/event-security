@@ -6,6 +6,9 @@ const state = {
   incidents: [],
   incidentStats: {},
   models: [],
+  auditLogs: [],
+  auditTotal: 0,
+  auditPage: 1,
   toast: ''
 };
 
@@ -78,6 +81,7 @@ const shell = (content) => h`
           <div class="side-group-title">事件聚合分析引擎</div>
           <a href="#/incidents" class="side-link ${state.route.startsWith('#/incidents') ? 'active' : ''}">安全事件</a>
           <a href="#/models" class="side-link ${state.route.startsWith('#/models') ? 'active' : ''}">安全事件模型</a>
+          <a href="#/audit" class="side-link ${state.route.startsWith('#/audit') ? 'active' : ''}">审计日志</a>
           <div class="side-group-title">历史回溯分析</div>
           <div class="side-group-title">运维监控</div>
         </div>
@@ -191,8 +195,8 @@ const renderModels = async () => {
       <h1>安全事件模型</h1>
       <div class="actions">
         <button class="btn primary" data-model-new>+ 新建</button>
-        <button class="btn">导入</button>
-        <button class="btn">导出</button>
+        <button class="btn" data-model-import>导入</button>
+        <button class="btn" data-model-export-all>导出</button>
       </div>
     </div>
     <div class="split">
@@ -224,7 +228,8 @@ const renderModels = async () => {
                 <td>
                   <button class="link-btn" data-model-detail="${esc(item.id)}">详情</button>　
                   <button class="link-btn" data-model-edit="${esc(item.id)}">编辑</button>　
-                  <button class="link-btn" data-model-toggle="${esc(item.id)}" data-status="${esc(item.status)}">${item.status === 'running' ? '停用' : '启用'}</button>
+                  <button class="link-btn" data-model-toggle="${esc(item.id)}" data-status="${esc(item.status)}">${item.status === 'running' ? '停用' : '启用'}</button>　
+                  <button class="link-btn" data-model-export="${esc(item.id)}">导出</button>
                 </td>
               </tr>
             `).join('')}
@@ -566,6 +571,116 @@ const getVisibleColumns = () => {
   return saved.filter((f) => f.visible).map((f) => f.key);
 };
 
+const loadAuditLogs = async (page = 1) => {
+  const data = await api(`/api/security/audit-logs?page=${page}&pageSize=20`);
+  state.auditLogs = data.items;
+  state.auditTotal = data.total;
+  state.auditPage = page;
+  return data;
+};
+
+const renderAuditLogs = async () => {
+  await loadAuditLogs(state.auditPage);
+  const totalPages = Math.max(1, Math.ceil(state.auditTotal / 20));
+  return h`
+    <div class="page-head">
+      <h1>审计日志</h1>
+    </div>
+    <section class="panel table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>操作</th>
+            <th>目标类型</th>
+            <th>目标ID</th>
+            <th>详情</th>
+            <th>用户</th>
+            <th>IP</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${state.auditLogs.map((item) => `
+            <tr>
+              <td>${esc(item.time)}</td>
+              <td>${esc(item.action)}</td>
+              <td>${esc(item.targetType)}</td>
+              <td>${esc(item.targetId)}</td>
+              <td>${esc(item.detail)}</td>
+              <td>${esc(item.user)}</td>
+              <td>${esc(item.ip)}</td>
+            </tr>
+          `).join('')}
+          ${state.auditLogs.length === 0 ? '<tr><td colspan="7" class="empty">暂无审计日志</td></tr>' : ''}
+        </tbody>
+      </table>
+      <div class="actions" style="justify-content:center;margin-top:12px">
+        <button class="btn" data-audit-prev ${state.auditPage <= 1 ? 'disabled' : ''}>上一页</button>
+        <span style="line-height:2">第 ${state.auditPage} / ${totalPages} 页（共 ${state.auditTotal} 条）</span>
+        <button class="btn" data-audit-next ${state.auditPage >= totalPages ? 'disabled' : ''}>下一页</button>
+      </div>
+    </section>
+  `;
+};
+
+const exportModel = async (id) => {
+  const response = await fetch(`/api/security/models/export?id=${id}`);
+  if (!response.ok) { toast('导出失败'); return; }
+  const blob = await response.blob();
+  const disposition = response.headers.get('content-disposition') || '';
+  const match = disposition.match(/filename\*?=(?:UTF-8''|"?)([^";]+)/i);
+  const filename = match ? decodeURIComponent(match[1]) : `model-${id}.json`;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  toast('导出成功');
+};
+
+const openImportModal = () => {
+  const modal = document.createElement('div');
+  modal.className = 'modal-backdrop';
+  modal.innerHTML = `
+    <div class="modal" style="max-width:440px">
+      <div class="modal-head"><h2>导入模型</h2><button class="btn ghost" data-close-modal>关闭</button></div>
+      <section class="panel" style="margin:16px">
+        <div class="field wide">
+          <label>选择 JSON 文件</label>
+          <input type="file" data-import-file accept=".json">
+        </div>
+      </section>
+      <div class="actions" style="justify-content:flex-end;padding:0 16px 16px">
+        <button class="btn ghost" data-close-modal>取消</button>
+        <button class="btn primary" data-import-submit>导入</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.addEventListener('click', async (e) => {
+    const t = e.target;
+    if (t.matches('[data-close-modal]')) modal.remove();
+    if (t.matches('[data-import-submit]')) {
+      const fileInput = modal.querySelector('[data-import-file]');
+      const file = fileInput?.files[0];
+      if (!file) { toast('请选择文件'); return; }
+      try {
+        const text = await file.text();
+        JSON.parse(text);
+        await api('/api/security/models/import', { method: 'POST', body: text, headers: { 'Content-Type': 'application/json' } });
+        modal.remove();
+        toast('导入成功');
+        render();
+      } catch (err) {
+        toast('导入失败：' + err.message);
+      }
+    }
+  });
+};
+
 const bindEvents = () => {
   app.onclick = async (event) => {
     const target = event.target;
@@ -642,6 +757,17 @@ const bindEvents = () => {
       const updates = allNodes.map((n) => ({ id: n.id, hidden: !activeTypes.includes(n._type) }));
       allNodes.update(updates);
     }
+    if (target.matches('[data-audit-prev]')) {
+      state.auditPage = Math.max(1, state.auditPage - 1);
+      render();
+    }
+    if (target.matches('[data-audit-next]')) {
+      state.auditPage++;
+      render();
+    }
+    if (target.matches('[data-model-import]')) openImportModal();
+    if (target.matches('[data-model-export-all]')) exportModel('');
+    if (target.matches('[data-model-export]')) exportModel(target.dataset.modelExport);
   };
 };
 
@@ -702,6 +828,7 @@ const render = async () => {
     else if (parts[0] === 'models' && parts[2] === 'edit') content = await renderModelForm(parts[1]);
     else if (parts[0] === 'models' && parts[1]) content = await renderModelDetail(parts[1]);
     else if (parts[0] === 'models') content = await renderModels();
+    else if (parts[0] === 'audit') content = await renderAuditLogs();
     else if (parts[0] === 'incidents' && parts[1]) content = await renderIncidentDetail(parts[1], parts[2] || 'overview');
     else content = await renderIncidents();
     app.innerHTML = shell(content);
