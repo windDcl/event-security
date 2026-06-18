@@ -1,7 +1,8 @@
 /**
  * searcher.js – Async Correlation Search Service
  *
- * Consumes tasks from Kafka topic 'nsm-incident-task', loads the model DSL
+ * Consumes aggregated alerts from Kafka topic 'nsm-aggregated-alert'
+ * (output by Flink AggregatorFunction), loads the model DSL
  * from PG (ice_rule.statement), replaces variable placeholders, compiles to ES
  * queries via ./dsl.js, executes searches, and updates incidents with
  * related alerts, graph data, and entity information.
@@ -16,7 +17,7 @@ import { validateDsl, extractVariables } from './dsl.js';
 // ── Constants ───────────────────────────────────────────────────────────────
 
 const CONSUMER_GROUP = 'nsm-incident-searcher';
-const TASK_TOPIC = 'nsm-incident-task';
+const TASK_TOPIC = 'nsm-aggregated-alert';
 
 // ── Variable Replacement ────────────────────────────────────────────────────
 
@@ -374,10 +375,12 @@ function buildVariables(task) {
  *   6. Update task progress in PG
  */
 async function handleTask(task) {
-  // Support both spec format (modelId) and aggregator format (iceRuleId)
-  const incidentId = task.incidentId;
-  const alertId = task.alertId;
-  const modelId = task.modelId || task.iceRuleId;
+  // Support multiple formats:
+  //   - Node.js Aggregator: { incidentId, alertId, modelId/iceRuleId }
+  //   - Flink Aggregator:   { incident_id, id, model_id }
+  const incidentId = task.incidentId || task.incident_id;
+  const alertId = task.alertId || task.id;
+  const modelId = task.modelId || task.iceRuleId || task.model_id;
   const variables = buildVariables(task);
 
   console.log(`[searcher] Processing task: incident=${incidentId}, alert=${alertId}, model=${modelId}`);
@@ -442,7 +445,8 @@ async function handleTask(task) {
 
 /**
  * Start the correlation search service.
- * Subscribes to Kafka topic 'nsm-incident-task' and processes each task.
+ * Subscribes to Kafka topic 'nsm-aggregated-alert' (output by Flink Aggregator)
+ * and processes each aggregated alert for DSL correlation + graph generation.
  */
 export async function startSearcher() {
   console.log('[searcher] Starting correlation search service…');

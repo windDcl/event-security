@@ -17,6 +17,7 @@ const kafka = new Kafka({
 const REQUIRED_TOPICS = [
   'nsm-xdr-events',
   'nsm-original-alert',
+  'nsm-aggregated-alert',
   'nsm-incident-events',
   'nsm-incident-task',
 ];
